@@ -18,3 +18,5 @@ mlruns/
 *.egg-info/
 build/
 dist/
+# Google Cloud service-account credentials
+/exit-513504-fa400176d60f.json
