@@ -14,6 +14,7 @@ import hashlib
 import inspect
 import json
 import logging
+import math
 import os
 import random
 import subprocess
@@ -318,8 +319,43 @@ class CompletionOnlyDataCollator:
         }
 
 
-def build_training_arguments(config: TrainingConfig) -> TrainingArguments:
+def build_training_arguments(
+    config: TrainingConfig,
+    train_dataset_size: Optional[int] = None,
+) -> TrainingArguments:
     """Construct arguments across the evaluation_strategy -> eval_strategy rename."""
+    parameters = inspect.signature(TrainingArguments.__init__).parameters
+    if "warmup_ratio" in parameters:
+        warmup_kwargs: Dict[str, Any] = {"warmup_ratio": config.warmup_ratio}
+        warmup_steps: Optional[int] = None
+    else:
+        if train_dataset_size is None:
+            raise ValueError(
+                "train_dataset_size is required when this Transformers version "
+                "does not support warmup_ratio"
+            )
+        if config.warmup_ratio < 0:
+            raise ValueError("warmup_ratio must be non-negative")
+        if config.max_steps > 0:
+            estimated_total_steps = config.max_steps
+        else:
+            effective_batch_size = (
+                config.per_device_train_batch_size
+                * config.gradient_accumulation_steps
+            )
+            steps_per_epoch = math.ceil(train_dataset_size / effective_batch_size)
+            estimated_total_steps = math.ceil(
+                steps_per_epoch * config.num_train_epochs
+            )
+        warmup_steps = math.ceil(estimated_total_steps * config.warmup_ratio)
+        warmup_kwargs = {"warmup_steps": warmup_steps}
+        logger.info(
+            "Warmup: %s steps (ratio %.4f of approximately %s optimizer steps)",
+            warmup_steps,
+            config.warmup_ratio,
+            estimated_total_steps,
+        )
+
     kwargs: Dict[str, Any] = {
         "output_dir": str(config.output_dir),
         "per_device_train_batch_size": config.per_device_train_batch_size,
@@ -327,7 +363,6 @@ def build_training_arguments(config: TrainingConfig) -> TrainingArguments:
         "gradient_accumulation_steps": config.gradient_accumulation_steps,
         "learning_rate": config.learning_rate,
         "weight_decay": config.weight_decay,
-        "warmup_ratio": config.warmup_ratio,
         "num_train_epochs": config.num_train_epochs,
         "max_steps": config.max_steps,
         "optim": "paged_adamw_8bit",
@@ -350,7 +385,7 @@ def build_training_arguments(config: TrainingConfig) -> TrainingArguments:
         "report_to": ["wandb"] if config.wandb_project else [],
         "run_name": config.experiment_name,
     }
-    parameters = inspect.signature(TrainingArguments.__init__).parameters
+    kwargs.update(warmup_kwargs)
     strategy_name = (
         "eval_strategy" if "eval_strategy" in parameters else "evaluation_strategy"
     )
@@ -458,7 +493,7 @@ def train(config: TrainingConfig) -> None:
 
         trainer = Trainer(
             model=model,
-            args=build_training_arguments(config),
+            args=build_training_arguments(config, train_dataset_size=len(train_data)),
             train_dataset=train_data,
             eval_dataset=validation_data,
             data_collator=CompletionOnlyDataCollator(
