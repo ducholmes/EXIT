@@ -159,7 +159,9 @@ runtime environment.
 The provided Hugging Face contexts can be used directly for a paired
 compressor-on/off comparison (they are not the paper's independently retrieved
 Top-k results). Export the validation split as JSONL with ten contexts per
-question:
+question. Rows that do not contain exactly ten contexts are skipped and
+recorded in the adjacent manifest so both evaluation conditions can use the
+same filtered input:
 
 ```bash
 python prepare_reproduce_data.py \

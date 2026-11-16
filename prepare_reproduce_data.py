@@ -7,6 +7,7 @@ import argparse
 from datetime import datetime, timezone
 import hashlib
 import json
+import logging
 from pathlib import Path
 from typing import Any, Dict, Mapping, Sequence
 
@@ -22,6 +23,8 @@ except ImportError as exc:  # pragma: no cover - depends on optional install
 DATASET_ID = "hotpotqa/hotpot_qa"
 CONFIG = "distractor"
 SPLIT = "validation"
+logging.basicConfig(format="%(levelname)s: %(message)s", level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
 def parse_args() -> argparse.Namespace:
@@ -64,11 +67,6 @@ def normalize_example(row: Mapping[str, Any]) -> Dict[str, Any]:
         raise ValueError(f"HotpotQA row {row.get('id')!r} has no question")
     if not isinstance(answer, str) or not answer.strip():
         raise ValueError(f"HotpotQA row {row.get('id')!r} has no answer")
-    if len(contexts) != 10:
-        raise ValueError(
-            f"distractor validation example {row.get('id')!r} has {len(contexts)} "
-            "contexts; expected 10"
-        )
     if any(not context["text"] for context in contexts):
         raise ValueError(f"HotpotQA row {row.get('id')!r} has an empty context")
 
@@ -99,19 +97,48 @@ def main() -> None:
         split=SPLIT,
         cache_dir=str(args.cache_dir),
     )
+    source_split_examples = len(raw_dataset)
     if args.limit is not None:
         raw_dataset = raw_dataset.select(range(min(args.limit, len(raw_dataset))))
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     temporary_path = args.output.with_suffix(args.output.suffix + ".tmp")
     count = 0
+    skipped_examples = []
     try:
         with temporary_path.open("w", encoding="utf-8", newline="\n") as output_file:
             for row in raw_dataset:
+                context = row.get("context")
+                if not isinstance(context, Mapping):
+                    raise ValueError(f"HotpotQA row {row.get('id')!r} has no context object")
+                titles = context.get("title", [])
+                sentence_lists = context.get("sentences", [])
+                if len(titles) != len(sentence_lists):
+                    raise ValueError(
+                        f"context title/sentence count mismatch for id={row.get('id')!r}"
+                    )
+                if len(titles) != 10:
+                    skipped_examples.append(
+                        {
+                            "id": str(row.get("id", "")),
+                            "context_count": len(titles),
+                            "reason": "expected exactly 10 contexts",
+                        }
+                    )
+                    logger.warning(
+                        "Skipping HotpotQA validation example %r: has %d contexts; expected 10",
+                        row.get("id"),
+                        len(titles),
+                    )
+                    continue
                 output_file.write(
                     json.dumps(normalize_example(row), ensure_ascii=False) + "\n"
                 )
                 count += 1
+        if count == 0:
+            raise ValueError(
+                "No HotpotQA validation examples with exactly 10 contexts were found"
+            )
         temporary_path.replace(args.output)
     except Exception:
         temporary_path.unlink(missing_ok=True)
@@ -121,7 +148,11 @@ def main() -> None:
         "source_dataset": DATASET_ID,
         "config": CONFIG,
         "split": SPLIT,
-        "examples": count,
+        "source_split_examples": source_split_examples,
+        "input_examples": len(raw_dataset),
+        "exported_examples": count,
+        "skipped_example_count": len(skipped_examples),
+        "skipped_examples": skipped_examples,
         "contexts_per_example": 10,
         "input_sha256": sha256_file(args.output),
         "created_utc": datetime.now(timezone.utc).isoformat(),
