@@ -1,0 +1,11 @@
+{
+  "model": "gemma-4-26b-a4b-it",
+  "project_id": "gen-lang-client-0037667143",
+  "quotas": {
+    "rpm": 30,
+    "input_tpm": 16000,
+    "rpd": 14400,
+    "safety_fraction": 0.9
+  },
+  "quota_state": "/kaggle/working/gemini_quota_state.json"
+}
