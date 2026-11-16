@@ -1,5 +1,5 @@
 {
-  "model": "gemma-4-26b-a4b-it",
+  "model": "gemma-4-31b-a4b-it",
   "project_id": "gen-lang-client-0037667143",
   "quotas": {
     "rpm": 30,
