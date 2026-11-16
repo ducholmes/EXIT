@@ -8,14 +8,16 @@ with an application-specific retriever.
 
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import List, Optional, Tuple
 import warnings
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from compressors import EXITCompressor, SearchResult
+from compressors.base import SearchResult
 from compressors.baselines.exit.core import build_qa_prompt
+from gemini_reader import GeminiAPIReader, GeminiQuota
 
 
 @dataclass(frozen=True)
@@ -28,7 +30,7 @@ class Document:
 
 
 class ExitRAG:
-    """EXIT compression followed by an instruction-tuned reader."""
+    """Optional EXIT compression followed by an instruction-tuned reader."""
 
     def __init__(
         self,
@@ -45,8 +47,14 @@ class ExitRAG:
         load_compressor_in_4bit: bool = True,
         max_new_tokens: int = 100,
         retriever_model: Optional[str] = None,
+        use_compressor: bool = True,
+        reader_backend: str = "transformers",
+        gemini_model: Optional[str] = None,
+        gemini_project_id: Optional[str] = None,
+        gemini_quota: Optional[GeminiQuota] = None,
+        gemini_quota_state: Optional[Path] = None,
     ) -> None:
-        """Load the paper compressor and downstream reader.
+        """Load the optional paper compressor and downstream reader.
 
         ``retriever_model`` is retained as a deprecated alias for
         ``compression_base_model``.  Earlier versions used that misleading name
@@ -63,44 +71,80 @@ class ExitRAG:
             compression_base_model = retriever_model
         if max_new_tokens < 1:
             raise ValueError("max_new_tokens must be at least 1")
+        if reader_backend not in ("transformers", "gemini"):
+            raise ValueError("reader_backend must be 'transformers' or 'gemini'")
 
-        print("Loading EXIT compressor and reader...")
-        self.compressor = EXITCompressor(
-            base_model=compression_base_model,
-            checkpoint=compression_model,
-            device=device,
-            cache_dir=cache_dir,
-            base_revision=compression_base_revision,
-            checkpoint_revision=compression_revision,
-            batch_size=batch_size,
-            threshold=threshold,
-            load_in_4bit=load_compressor_in_4bit,
-        )
+        self.use_compressor = use_compressor
+        self.reader_backend = reader_backend
+        if self.use_compressor:
+            from compressors import EXITCompressor
 
-        reader_kwargs = {
-            "cache_dir": cache_dir,
-            "device_map": "auto" if device is None else {"": device},
-            "revision": reader_revision,
-        }
-        if device is None or not str(device).startswith("cpu"):
-            reader_kwargs["torch_dtype"] = torch.float16
-        self.reader = AutoModelForCausalLM.from_pretrained(
-            reader_model,
-            **reader_kwargs,
-        )
-        self.reader.eval()
-        self.reader_tokenizer = AutoTokenizer.from_pretrained(
-            reader_model,
-            cache_dir=cache_dir,
-            revision=reader_revision,
-        )
-        if self.reader_tokenizer.pad_token_id is None:
-            self.reader_tokenizer.pad_token = self.reader_tokenizer.eos_token
+            print("Loading EXIT compressor...")
+            self.compressor = EXITCompressor(
+                base_model=compression_base_model,
+                checkpoint=compression_model,
+                device=device,
+                cache_dir=cache_dir,
+                base_revision=compression_base_revision,
+                checkpoint_revision=compression_revision,
+                batch_size=batch_size,
+                threshold=threshold,
+                load_in_4bit=load_compressor_in_4bit,
+            )
+        else:
+            print("Loading reader without EXIT compression...")
+            self.compressor = None
 
-        self.reader_device = next(self.reader.parameters()).device
+        self.reader = None
+        self.reader_tokenizer = None
+        self.reader_device = None
+        self.gemini_reader = None
+        if reader_backend == "gemini":
+            if (
+                not gemini_model
+                or not gemini_project_id
+                or gemini_quota is None
+                or gemini_quota_state is None
+            ):
+                raise ValueError(
+                    "Gemini reader requires a model, project ID, configured quotas, "
+                    "and a quota-state path"
+                )
+            self.gemini_reader = GeminiAPIReader(
+                model=gemini_model,
+                project_id=gemini_project_id,
+                quota=gemini_quota,
+                quota_state_path=gemini_quota_state,
+                max_new_tokens=max_new_tokens,
+            )
+            self.reader_model_id = gemini_model
+        else:
+            reader_kwargs = {
+                "cache_dir": cache_dir,
+                "device_map": "auto" if device is None else {"": device},
+                "revision": reader_revision,
+            }
+            if device is None or not str(device).startswith("cpu"):
+                reader_kwargs["torch_dtype"] = torch.float16
+            self.reader = AutoModelForCausalLM.from_pretrained(
+                reader_model,
+                **reader_kwargs,
+            )
+            self.reader.eval()
+            self.reader_tokenizer = AutoTokenizer.from_pretrained(
+                reader_model,
+                cache_dir=cache_dir,
+                revision=reader_revision,
+            )
+            if self.reader_tokenizer.pad_token_id is None:
+                self.reader_tokenizer.pad_token = self.reader_tokenizer.eos_token
+            self.reader_device = next(self.reader.parameters()).device
+            self.reader_model_id = reader_model
         self.max_new_tokens = max_new_tokens
         self.last_compression_time = 0.0
         self.last_compression_result = None
+        self.last_reader_input_tokens = 0
+        self.last_reader_usage = {}
 
     @staticmethod
     def _synchronize_cuda() -> None:
@@ -131,6 +175,12 @@ class ExitRAG:
     ) -> Tuple[str, List[bool], List[float]]:
         """Split, batch-score, and reassemble retrieved documents."""
 
+        if self.compressor is None:
+            raise RuntimeError(
+                "Cannot compress documents because this ExitRAG instance was "
+                "created with use_compressor=False."
+            )
+
         self._synchronize_cuda()
         started_at = time.perf_counter()
         result = self.compressor.compress_with_details(
@@ -154,6 +204,14 @@ class ExitRAG:
         self._synchronize_cuda()
         started_at = time.perf_counter()
         prompt_content = build_qa_prompt(query=query, context=context)
+        if self.reader_backend == "gemini":
+            assert self.gemini_reader is not None
+            answer, reading_time = self.gemini_reader.generate(prompt_content)
+            self.last_reader_input_tokens = self.gemini_reader.last_input_tokens
+            self.last_reader_usage = dict(self.gemini_reader.last_usage)
+            return answer, reading_time
+
+        assert self.reader is not None and self.reader_tokenizer is not None
         prompt = self.reader_tokenizer.apply_chat_template(
             [{"role": "user", "content": prompt_content}],
             tokenize=False,
@@ -193,6 +251,8 @@ class ExitRAG:
             skip_special_tokens=True,
         ).strip()
         reading_time = time.perf_counter() - started_at
+        self.last_reader_input_tokens = int(inputs.input_ids.size(1))
+        self.last_reader_usage = {"input_tokens": self.last_reader_input_tokens}
         return answer, reading_time
 
     def run_rag(
@@ -201,42 +261,71 @@ class ExitRAG:
         documents: List[Document],
         compression_threshold: Optional[float] = None,
     ) -> dict:
-        """Run compression and reading while reporting paper latency fields."""
-
-        compressed_text, selections, scores = self.compress_documents(
-            query=query,
-            documents=documents,
-            threshold=compression_threshold,
-        )
-        answer, reading_time = self.generate_answer(query, compressed_text)
+        """Run optional compression and reading with paper latency fields."""
 
         original_context = "\n\n".join(
             f"{document.title}\n{document.text}" if document.title else document.text
             for document in documents
         )
-        original_tokens = len(
-            self.reader_tokenizer.encode(original_context, add_special_tokens=False)
-        )
-        compressed_tokens = len(
-            self.reader_tokenizer.encode(compressed_text, add_special_tokens=False)
-        )
-        details = self.last_compression_result
+        if self.use_compressor:
+            compressed_text, selections, scores = self.compress_documents(
+                query=query,
+                documents=documents,
+                threshold=compression_threshold,
+            )
+            details = self.last_compression_result
+            sentences = list(details.sentences)
+            sentence_document_indices = list(details.document_indices)
+            sentence_indices = list(details.sentence_indices)
+        else:
+            compressed_text = original_context
+            selections = []
+            scores = []
+            sentences = []
+            sentence_document_indices = []
+            sentence_indices = []
+            self.last_compression_time = 0.0
+            self.last_compression_result = None
 
+        original_prompt_tokens = None
+        if self.reader_backend == "gemini" and self.use_compressor:
+            assert self.gemini_reader is not None
+            original_prompt = build_qa_prompt(query=query, context=original_context)
+            original_prompt_tokens = self.gemini_reader.count_input_tokens(original_prompt)
+
+        answer, reading_time = self.generate_answer(query, compressed_text)
+
+        if self.reader_backend == "gemini":
+            if self.use_compressor:
+                original_tokens = int(original_prompt_tokens or 0)
+                compressed_tokens = self.last_reader_input_tokens
+            else:
+                original_tokens = self.last_reader_input_tokens
+                compressed_tokens = self.last_reader_input_tokens
+        else:
+            assert self.reader_tokenizer is not None
+            original_tokens = len(
+                self.reader_tokenizer.encode(original_context, add_special_tokens=False)
+            )
+            compressed_tokens = len(
+                self.reader_tokenizer.encode(compressed_text, add_special_tokens=False)
+            )
         return {
             "query": query,
             "compressed_context": compressed_text,
             "answer": answer,
             "sentence_selections": selections,
             "relevance_scores": scores,
-            "sentences": list(details.sentences),
-            "sentence_document_indices": list(details.document_indices),
-            "sentence_indices": list(details.sentence_indices),
+            "sentences": sentences,
+            "sentence_document_indices": sentence_document_indices,
+            "sentence_indices": sentence_indices,
             "original_tokens": original_tokens,
             "compressed_tokens": compressed_tokens,
             "compression_time": self.last_compression_time,
             "reading_time": reading_time,
             "generation_time": reading_time,
             "total_time": self.last_compression_time + reading_time,
+            "reader_usage": dict(self.last_reader_usage),
         }
 
 

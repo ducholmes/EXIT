@@ -20,3 +20,6 @@ build/
 dist/
 # Google Cloud service-account credentials
 /exit-513504-fa400176d60f.json
+/configs/gemini_api.json
+
+/checkpoint*

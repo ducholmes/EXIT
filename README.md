@@ -79,6 +79,25 @@ candidate's source document. It never concatenates all Top-k documents into
 error rather than silently truncating the candidate sentence or classifier
 instruction.
 
+To run the same reader without loading or using the compressor, set
+`use_compressor=False`. The original retrieved documents are passed to the
+reader as context:
+
+```python
+rag = ExitRAG(
+    reader_model="meta-llama/Llama-3.1-8B-Instruct",
+    use_compressor=False,
+)
+result = rag.run_rag(query, documents)
+print(result["compressed_context"])  # Contains the original, uncompressed context
+print(result["compression_time"])    # 0.0
+```
+
+The no-compressor path still applies the reader's context length limit, so
+long retrieved contexts can raise an overflow error. For benchmark runs, add
+`--no-compressor` to the `reproduce.py` command; compression latency is zero
+and the summary marks the compressor as disabled.
+
 ## Reproducing the paper setup
 
 The immutable reference settings and all items not reported by the paper are in
@@ -135,10 +154,54 @@ neighboring `*.summary.json` records metrics, token retention, per-stage
 latency, input SHA-256, Git SHA, requested/resolved model revisions, and the
 runtime environment.
 
-The runner currently uses Transformers. The paper's latency numbers use vLLM
-0.5.5 and therefore must not be compared directly with these timings. Retrieval
-latency is excluded because the paper's reported end-to-end table measures
-compression plus reader generation.
+### HotpotQA distractor validation with a Gemma API reader
+
+The provided Hugging Face contexts can be used directly for a paired
+compressor-on/off comparison (they are not the paper's independently retrieved
+Top-k results). Export the validation split as JSONL with ten contexts per
+question:
+
+```bash
+python prepare_reproduce_data.py \
+  --output data/hotpotqa-distractor-validation.jsonl
+```
+
+Copy `configs/gemini_api.example.json` to `configs/gemini_api.json`, set the
+AI Studio project ID, choose `gemma-4-26b-a4b-it` or `gemma-4-31b-it`, and fill
+in that model's RPM, input TPM, and RPD values from AI Studio. The runner uses
+80% of each configured limit, counts input tokens before each generation call, stores usage state, and
+pauses when its safe daily budget is reached. Set `GEMINI_API_KEY` in the
+environment. Keep using the same quota state file for both runs so usage is
+shared between them.
+
+Run the two conditions on the identical input with `--top-k 10`:
+
+```bash
+python reproduce.py \
+  --input data/hotpotqa-distractor-validation.jsonl \
+  --output results/hotpotqa-gemma-exit.jsonl \
+  --dataset hotpotqa --split validation --top-k 10 \
+  --reader-backend gemini --gemini-config configs/gemini_api.json
+
+python reproduce.py \
+  --input data/hotpotqa-distractor-validation.jsonl \
+  --output results/hotpotqa-gemma-no-exit.jsonl \
+  --dataset hotpotqa --split validation --top-k 10 \
+  --reader-backend gemini --gemini-config configs/gemini_api.json \
+  --no-compressor
+```
+
+Each completed example is appended immediately. If the daily safe cap is
+reached, rerun the same command after the Pacific-time reset to resume. A 429
+from Google pauses the run without automatic retries; check the AI Studio
+project usage before resuming. Quota state covers only this runner, so use a
+dedicated project or account for other API traffic from that project. The API
+key is read from the environment and is never written to the output.
+
+The runner supports Transformers and the Gemini API. API/network latency is
+not directly comparable with local Transformers or the paper's vLLM 0.5.5
+latency. Retrieval latency is excluded because the paper's reported end-to-end
+table measures compression plus reader generation.
 
 ### Important reproduction limits
 

@@ -3,9 +3,8 @@
 
 The runner intentionally starts after retrieval.  It expects the CompAct-style
 ``question``/``answers``/``ctxs`` artifacts described in the README, then
-measures EXIT compression plus reader generation.  This matches the latency
-boundary used by the paper tables; rebuilding the December 2018 Wikipedia
-Contriever index remains a separate retrieval step.
+measures reader generation with optional EXIT compression.  Rebuilding the
+December 2018 Wikipedia Contriever index remains a separate retrieval step.
 """
 
 import argparse
@@ -19,11 +18,13 @@ import re
 import statistics
 import string
 import subprocess
+import sys
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 
 from exit_rag import Document, ExitRAG
+from gemini_reader import DailyQuotaReached, GeminiAPIError, GeminiQuota
 
 
 PAPER_SPLITS = {
@@ -202,7 +203,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--dataset", choices=sorted(PAPER_SPLITS), required=True)
     parser.add_argument("--split", help="Defaults to the paper split for the dataset")
-    parser.add_argument("--top-k", type=int, choices=(5, 20), default=5)
+    parser.add_argument("--top-k", type=int, choices=(5, 10, 20), default=5)
     parser.add_argument("--limit", type=int)
     parser.add_argument("--latency-repeats", type=int, default=1)
     parser.add_argument("--warmup-runs", type=int, default=0)
@@ -210,6 +211,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--compression-base-model", default="google/gemma-2b-it")
     parser.add_argument("--compression-model", default="doubleyyh/exit-gemma-2b")
     parser.add_argument("--reader-model", default="meta-llama/Llama-3.1-8B-Instruct")
+    parser.add_argument(
+        "--reader-backend", choices=("transformers", "gemini"), default="transformers"
+    )
+    parser.add_argument(
+        "--gemini-config",
+        type=Path,
+        help="JSON with model-specific Gemini quotas; required for --reader-backend gemini",
+    )
+    parser.add_argument(
+        "--gemini-quota-state",
+        type=Path,
+        help="Persistent state file shared by compressor-on/off runs",
+    )
     parser.add_argument("--compression-base-revision")
     parser.add_argument("--compression-revision")
     parser.add_argument("--reader-revision")
@@ -219,6 +233,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device")
     parser.add_argument("--cache-dir", default="./cache")
     parser.add_argument("--no-4bit", action="store_true")
+    parser.add_argument(
+        "--no-compressor",
+        action="store_true",
+        help="Pass retrieved documents directly to the reader without EXIT compression",
+    )
     args = parser.parse_args()
 
     if args.limit is not None and args.limit < 1:
@@ -231,6 +250,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--batch-size must be at least 1")
     if not 0.0 <= args.threshold <= 1.0:
         parser.error("--threshold must be between 0 and 1")
+    if args.reader_backend == "gemini" and args.latency_repeats != 1:
+        parser.error("Gemini API runs require --latency-repeats 1 to avoid duplicate billable calls")
+    if args.reader_backend == "gemini" and args.warmup_runs:
+        parser.error("Gemini API runs do not support warm-up calls; they consume API quota")
     return args
 
 
@@ -253,6 +276,35 @@ def main() -> None:
         )
         return
 
+    gemini_model = None
+    gemini_project_id = None
+    gemini_quota = None
+    quota_state_path = None
+    if args.reader_backend == "gemini":
+        if args.gemini_config is None:
+            raise ValueError("--gemini-config is required with --reader-backend gemini")
+        if not os.environ.get("GEMINI_API_KEY"):
+            raise ValueError("Set GEMINI_API_KEY in the environment before using Gemini")
+        with args.gemini_config.open("r", encoding="utf-8") as config_file:
+            gemini_config = json.load(config_file)
+        gemini_model = gemini_config.get("model")
+        if not isinstance(gemini_model, str) or not gemini_model.strip():
+            raise ValueError("Gemini config needs a non-empty 'model' field")
+        gemini_project_id = gemini_config.get("project_id")
+        if not isinstance(gemini_project_id, str) or not gemini_project_id.strip():
+            raise ValueError("Gemini config needs a non-empty 'project_id' field")
+        quota_values = gemini_config.get("quotas")
+        if not isinstance(quota_values, dict):
+            raise ValueError("Gemini config needs a 'quotas' object")
+        gemini_quota = GeminiQuota.from_mapping(quota_values)
+        configured_state = gemini_config.get("quota_state")
+        quota_state_path = args.gemini_quota_state or (
+            Path(configured_state) if configured_state else None
+        )
+        if quota_state_path is None:
+            safe_model_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", gemini_model)
+            quota_state_path = Path(args.cache_dir) / f"gemini-quota-{safe_model_name}.json"
+
     rag = ExitRAG(
         compression_base_model=args.compression_base_model,
         compression_model=args.compression_model,
@@ -266,6 +318,12 @@ def main() -> None:
         reader_revision=args.reader_revision,
         load_compressor_in_4bit=not args.no_4bit,
         max_new_tokens=args.max_new_tokens,
+        use_compressor=not args.no_compressor,
+        reader_backend=args.reader_backend,
+        gemini_model=gemini_model,
+        gemini_project_id=gemini_project_id,
+        gemini_quota=gemini_quota,
+        gemini_quota_state=quota_state_path,
     )
 
     if args.warmup_runs:
@@ -280,21 +338,73 @@ def main() -> None:
             )
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    records = []
-    all_compression_times = []
-    all_reading_times = []
-    all_total_times = []
-    exact_matches = []
-    f1_scores = []
+    input_digest = file_sha256(args.input)
+    progress_path = args.output.with_suffix(args.output.suffix + ".progress.json")
+    run_fingerprint = {
+        "input_sha256": input_digest,
+        "dataset": args.dataset,
+        "split": args.split or PAPER_SPLITS[args.dataset],
+        "top_k": args.top_k,
+        "compressor_enabled": not args.no_compressor,
+        "threshold": args.threshold,
+        "latency_repeats": args.latency_repeats,
+        "reader_backend": args.reader_backend,
+        "reader_model": gemini_model if args.reader_backend == "gemini" else args.reader_model,
+        "gemini_project_id": gemini_project_id,
+        "max_new_tokens": args.max_new_tokens,
+        "limit": args.limit,
+        "compression_base_model": args.compression_base_model,
+        "compression_model": args.compression_model,
+        "batch_size": args.batch_size,
+    }
+    if progress_path.exists():
+        saved_fingerprint = json.loads(progress_path.read_text(encoding="utf-8"))
+        if saved_fingerprint != run_fingerprint:
+            raise ValueError(
+                f"Existing progress file {progress_path} belongs to a different run; "
+                "choose a new --output path or remove the stale progress/output files."
+            )
+    elif args.output.exists() and args.output.stat().st_size:
+        raise ValueError(
+            f"Output {args.output} exists without its progress manifest; choose a new path."
+        )
+    else:
+        progress_path.write_text(
+            json.dumps(run_fingerprint, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+    records_by_index = {}
+    if args.output.exists():
+        with args.output.open("r", encoding="utf-8") as previous_output:
+            for line_number, line in enumerate(previous_output, start=1):
+                if line.strip():
+                    record = json.loads(line)
+                    records_by_index[int(record["index"])] = record
 
     for index, example in enumerate(examples):
+        if index in records_by_index:
+            continue
         query = get_query(example)
         answers = get_answers(example)
         documents = get_documents(example, args.top_k)
-        runs = [
-            rag.run_rag(query, documents, compression_threshold=args.threshold)
-            for _ in range(args.latency_repeats)
-        ]
+        try:
+            runs = [
+                rag.run_rag(query, documents, compression_threshold=args.threshold)
+                for _ in range(args.latency_repeats)
+            ]
+        except DailyQuotaReached as exc:
+            print(f"Gemini run paused safely: {exc}", file=sys.stderr)
+            break
+        except GeminiAPIError as exc:
+            print(f"Gemini run paused safely: {exc}", file=sys.stderr)
+            if exc.status == 429:
+                print(
+                    "The API returned 429 despite local limits. Check AI Studio "
+                    "usage and resume only after the affected quota resets.",
+                    file=sys.stderr,
+                )
+            break
         result = runs[0]
         compression_times = [run["compression_time"] for run in runs]
         reading_times = [run["reading_time"] for run in runs]
@@ -304,9 +414,6 @@ def main() -> None:
             exact_matches.append(em)
             f1_scores.append(f1)
 
-        all_compression_times.extend(compression_times)
-        all_reading_times.extend(reading_times)
-        all_total_times.extend(total_times)
         record = {
             "index": index,
             "id": example.get("id", example.get("_id", index)),
@@ -326,12 +433,50 @@ def main() -> None:
             "compression_latency": latency_summary(compression_times),
             "reading_latency": latency_summary(reading_times),
             "total_latency": latency_summary(total_times),
+            "reader_usage": result.get("reader_usage", {}),
         }
-        records.append(record)
-
-    with args.output.open("w", encoding="utf-8") as output_file:
-        for record in records:
+        with args.output.open("a", encoding="utf-8") as output_file:
             output_file.write(json.dumps(record, ensure_ascii=False) + "\n")
+            output_file.flush()
+            os.fsync(output_file.fileno())
+        records_by_index[index] = record
+
+    if len(records_by_index) != len(examples):
+        print(
+            f"Run paused after {len(records_by_index)}/{len(examples)} examples. "
+            f"Resume with the same arguments and output path: {args.output}",
+            file=sys.stderr,
+        )
+        return
+
+    records = [records_by_index[index] for index in range(len(examples))]
+    exact_matches = [record["exact_match"] for record in records if record["exact_match"] is not None]
+    f1_scores = [record["f1"] for record in records if record["f1"] is not None]
+    reader_usage_totals = {
+        "input_tokens": sum(
+            int(record.get("reader_usage", {}).get("input_tokens", 0))
+            for record in records
+        ),
+        "output_tokens": sum(
+            int(record.get("reader_usage", {}).get("output_tokens", 0))
+            for record in records
+        ),
+        "thought_tokens": sum(
+            int(record.get("reader_usage", {}).get("thought_tokens", 0))
+            for record in records
+        ),
+    }
+
+    def pooled_latency(field: str) -> Dict[str, float]:
+        per_example = [record[field] for record in records]
+        pooled_mean = mean([item["mean"] for item in per_example])
+        pooled_variance = mean(
+            [
+                item["std"] ** 2 + (item["mean"] - pooled_mean) ** 2
+                for item in per_example
+            ]
+        )
+        return {"mean": pooled_mean, "std": pooled_variance**0.5}
 
     original_tokens = [record["original_tokens"] for record in records]
     compressed_tokens = [record["compressed_tokens"] for record in records]
@@ -341,7 +486,7 @@ def main() -> None:
         "dataset": args.dataset,
         "split": args.split or PAPER_SPLITS[args.dataset],
         "input": str(args.input.resolve()),
-        "input_sha256": file_sha256(args.input),
+        "input_sha256": input_digest,
         "examples": len(records),
         "top_k": args.top_k,
         "metrics_percent": {
@@ -352,6 +497,11 @@ def main() -> None:
         "tokens": {
             "original_mean": mean(original_tokens),
             "compressed_mean": mean(compressed_tokens),
+            "scope": (
+                "reader prompt input tokens, including the question and fixed instructions"
+                if args.reader_backend == "gemini"
+                else "context tokens"
+            ),
             "retained_fraction": (
                 sum(compressed_tokens) / sum(original_tokens)
                 if sum(original_tokens)
@@ -359,36 +509,74 @@ def main() -> None:
             ),
         },
         "latency_seconds": {
-            "compression": latency_summary(all_compression_times),
-            "reading": latency_summary(all_reading_times),
-            "total": latency_summary(all_total_times),
+            "compression": pooled_latency("compression_latency"),
+            "reading": pooled_latency("reading_latency"),
+            "total": pooled_latency("total_latency"),
             "repeats": args.latency_repeats,
             "warmup_runs": args.warmup_runs,
-            "backend": "transformers",
+            "backend": args.reader_backend,
             "paper_backend": "vLLM 0.5.5",
+            "reader_api_usage": reader_usage_totals,
         },
         "models": {
-            "compression_base": args.compression_base_model,
-            "compression_adapter": args.compression_model,
-            "reader": args.reader_model,
+            "compression_base": (
+                args.compression_base_model if rag.use_compressor else None
+            ),
+            "compression_adapter": args.compression_model if rag.use_compressor else None,
+            "reader": rag.reader_model_id,
             "requested_revisions": {
-                "compression_base": args.compression_base_revision,
-                "compression_adapter": args.compression_revision,
+                "compression_base": (
+                    args.compression_base_revision if rag.use_compressor else None
+                ),
+                "compression_adapter": (
+                    args.compression_revision if rag.use_compressor else None
+                ),
                 "reader": args.reader_revision,
             },
             "resolved_revisions": {
-                "compression_base": resolved_revision(rag.compressor.base_model),
-                "compression_adapter": resolved_adapter_revision(rag.compressor.model),
-                "reader": resolved_revision(rag.reader),
+                "compression_base": (
+                    resolved_revision(rag.compressor.base_model)
+                    if rag.compressor is not None
+                    else None
+                ),
+                "compression_adapter": (
+                    resolved_adapter_revision(rag.compressor.model)
+                    if rag.compressor is not None
+                    else None
+                ),
+                "reader": (
+                    resolved_revision(rag.reader)
+                    if rag.reader is not None
+                    else None
+                ),
             },
         },
         "inference": {
+            "compressor_enabled": rag.use_compressor,
             "threshold": args.threshold,
             "batch_size": args.batch_size,
-            "temperature": 0.0,
-            "top_p": 1.0,
+            "temperature": 0.0 if args.reader_backend == "transformers" else None,
+            "top_p": 1.0 if args.reader_backend == "transformers" else None,
+            "thinking_level": "MINIMAL" if args.reader_backend == "gemini" else None,
             "max_new_tokens": args.max_new_tokens,
-            "compressor_4bit": not args.no_4bit,
+            "compressor_4bit": not args.no_4bit if rag.use_compressor else None,
+            "gemini_quota": (
+                {
+                    "configured": {
+                        "rpm": gemini_quota.rpm,
+                        "input_tpm": gemini_quota.input_tpm,
+                        "rpd": gemini_quota.rpd,
+                    },
+                    "safety_fraction": gemini_quota.safety_fraction,
+                    "safe_limits": {
+                        "rpm": gemini_quota.safe_rpm,
+                        "input_tpm": gemini_quota.safe_input_tpm,
+                        "rpd": gemini_quota.safe_rpd,
+                    },
+                }
+                if gemini_quota is not None
+                else None
+            ),
         },
         "environment": {
             "python": platform.python_version(),
@@ -405,8 +593,16 @@ def main() -> None:
             "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
         },
         "notes": [
-            "Retrieval latency is excluded, matching the paper's compression+reader tables.",
-            "Transformers latency must not be compared directly with the paper's vLLM 0.5.5 latency.",
+            (
+                "Retrieval latency is excluded; compression is skipped."
+                if args.no_compressor
+                else "Retrieval latency is excluded, matching the paper's compression+reader tables."
+            ),
+            (
+                "Gemini API latency includes network/service time and is not directly comparable with local or paper vLLM latency."
+                if args.reader_backend == "gemini"
+                else "Transformers latency must not be compared directly with the paper's vLLM 0.5.5 latency."
+            ),
             "The paper does not publish exact dataset/index/model revisions; pin and record them for strict reruns.",
         ],
     }
