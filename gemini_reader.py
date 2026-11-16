@@ -254,7 +254,7 @@ class GeminiAPIReader:
         self.last_usage: Dict[str, int] = {}
 
     def _post(self, method: str, payload: Dict) -> Dict:
-        url = f"{API_ROOT}/{quote(self.model, safe='')}/{method}"
+        url = f"{API_ROOT}/{quote(self.model, safe='')}:{method}"
         request = Request(
             url,
             data=json.dumps(payload).encode("utf-8"),
