@@ -155,8 +155,21 @@ class ExitEvaluator:
                 "evaluation never silently truncates document context"
             )
         inputs = inputs.to(self.input_device)
-        logits = self.model(**inputs).logits[:, -1, :]
+        if self.input_device.type == "cuda":
+            # Match Trainer's fp16 mixed-precision inference context. Loading
+            # Gemma 3 weights in fp16 and calling forward without autocast can
+            # overflow and return non-finite logits.
+            with torch.autocast(device_type="cuda", dtype=torch.float16):
+                logits = self.model(**inputs).logits[:, -1, :]
+        else:
+            logits = self.model(**inputs).logits[:, -1, :]
         binary_logits = logits[:, [self.yes_token_id, self.no_token_id]].float()
+        if not torch.isfinite(binary_logits).all():
+            raise FloatingPointError(
+                "Model produced non-finite Yes/No logits. Evaluation stopped "
+                "instead of treating NaN probabilities as No; check model dtype, "
+                "adapter weights, and precision settings."
+            )
         yes_probabilities = torch.softmax(binary_logits, dim=-1)[:, 0]
         probabilities = yes_probabilities.detach().cpu().tolist()
         predictions = [

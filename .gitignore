@@ -24,3 +24,5 @@ dist/
 /checkpoint*
 
 /final_model
+
+/exit-evaluation
