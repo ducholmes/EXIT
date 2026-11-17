@@ -55,6 +55,7 @@ class ExitEvaluator:
         device: str = "auto",
         cache_dir: str = "./cache",
         load_in_4bit: bool = True,
+        dtype: str = "auto",
         base_revision: str | None = None,
         checkpoint_revision: str | None = None,
     ) -> None:
@@ -65,6 +66,20 @@ class ExitEvaluator:
             raise RuntimeError("--device cuda requested but CUDA is unavailable")
         if load_in_4bit and not use_cuda:
             raise ValueError("4-bit bitsandbytes evaluation requires CUDA")
+        if dtype not in {"auto", "bf16", "fp32"}:
+            raise ValueError("dtype must be one of: auto, bf16, fp32")
+
+        # Gemma 3 can produce non-finite logits with fp16 inference. Prefer
+        # bf16 where the GPU supports it; otherwise use fp32 for evaluation.
+        bf16_supported = use_cuda and torch.cuda.is_bf16_supported()
+        if dtype == "bf16" and not bf16_supported:
+            raise ValueError("--dtype bf16 requires a CUDA GPU with BF16 support")
+        inference_dtype = torch.bfloat16 if (
+            dtype == "bf16" or (dtype == "auto" and bf16_supported)
+        ) else torch.float32
+        self.inference_dtype = inference_dtype
+        dtype_name = "bf16" if inference_dtype == torch.bfloat16 else "fp32"
+        logger.info("Evaluation dtype: %s", dtype_name)
 
         self.tokenizer = AutoTokenizer.from_pretrained(
             base_model_path,
@@ -77,14 +92,14 @@ class ExitEvaluator:
 
         model_kwargs: Dict[str, Any] = {
             "cache_dir": cache_dir,
-            "torch_dtype": torch.float16 if use_cuda else torch.float32,
+            "torch_dtype": inference_dtype,
         }
         if use_cuda:
             model_kwargs["device_map"] = "auto"
         if load_in_4bit:
             model_kwargs["quantization_config"] = BitsAndBytesConfig(
                 load_in_4bit=True,
-                bnb_4bit_compute_dtype=torch.float16,
+                bnb_4bit_compute_dtype=inference_dtype,
                 bnb_4bit_quant_type="nf4",
                 bnb_4bit_use_double_quant=True,
             )
@@ -155,11 +170,8 @@ class ExitEvaluator:
                 "evaluation never silently truncates document context"
             )
         inputs = inputs.to(self.input_device)
-        if self.input_device.type == "cuda":
-            # Match Trainer's fp16 mixed-precision inference context. Loading
-            # Gemma 3 weights in fp16 and calling forward without autocast can
-            # overflow and return non-finite logits.
-            with torch.autocast(device_type="cuda", dtype=torch.float16):
+        if self.input_device.type == "cuda" and self.inference_dtype == torch.bfloat16:
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 logits = self.model(**inputs).logits[:, -1, :]
         else:
             logits = self.model(**inputs).logits[:, -1, :]
@@ -203,6 +215,7 @@ def evaluate_model(
     device: str = "auto",
     cache_dir: str = "./cache",
     load_in_4bit: bool = True,
+    dtype: str = "auto",
     base_revision: str | None = None,
     checkpoint_revision: str | None = None,
 ) -> Dict[str, Any]:
@@ -216,6 +229,7 @@ def evaluate_model(
         device=device,
         cache_dir=cache_dir,
         load_in_4bit=load_in_4bit,
+        dtype=dtype,
         base_revision=base_revision,
         checkpoint_revision=checkpoint_revision,
     )
@@ -327,6 +341,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto")
+    parser.add_argument(
+        "--dtype",
+        choices=["auto", "bf16", "fp32"],
+        default="auto",
+        help="Evaluation precision (auto selects BF16 when the CUDA GPU supports it, otherwise FP32).",
+    )
     parser.add_argument("--cache_dir", default="./cache")
     parser.add_argument(
         "--no_4bit",
@@ -353,6 +373,7 @@ def main() -> None:
         device=args.device,
         cache_dir=args.cache_dir,
         load_in_4bit=args.load_in_4bit,
+        dtype=args.dtype,
         base_revision=args.base_revision,
         checkpoint_revision=args.checkpoint_revision,
     )
