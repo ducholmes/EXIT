@@ -11,8 +11,10 @@ import json
 import math
 import os
 from pathlib import Path
+import random
+import socket
 import time
-from typing import Deque, Dict, Optional, Tuple
+from typing import Callable, Deque, Dict, Optional, Tuple
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
@@ -55,9 +57,16 @@ def pacific_now() -> datetime:
 class GeminiAPIError(RuntimeError):
     """An API request failed; quota errors are never retried automatically."""
 
-    def __init__(self, status: Optional[int], message: str) -> None:
+    def __init__(
+        self,
+        status: Optional[int],
+        message: str,
+        *,
+        retryable_timeout: bool = False,
+    ) -> None:
         self.status = status
         self.message = message
+        self.retryable_timeout = retryable_timeout
         super().__init__(f"Gemini API HTTP {status}: {message}" if status else message)
 
 
@@ -239,7 +248,8 @@ class GeminiAPIReader:
         quota_state_path: Path,
         api_key: Optional[str] = None,
         max_new_tokens: int = 100,
-        timeout_seconds: int = 120,
+        timeout_seconds: int = 300,
+        max_attempts: int = 3,
     ) -> None:
         self.model = model
         self.api_key = api_key or os.environ.get("GEMINI_API_KEY")
@@ -247,13 +257,26 @@ class GeminiAPIReader:
             raise ValueError("Set GEMINI_API_KEY in the environment before using Gemini")
         if max_new_tokens < 1:
             raise ValueError("max_new_tokens must be at least 1")
+        if timeout_seconds < 1:
+            raise ValueError("timeout_seconds must be at least 1")
+        if max_attempts < 1:
+            raise ValueError("max_attempts must be at least 1")
         self.max_new_tokens = max_new_tokens
         self.timeout_seconds = timeout_seconds
+        self.max_attempts = max_attempts
         self.guard = QuotaGuard(model, project_id, quota, quota_state_path)
         self.last_input_tokens = 0
         self.last_usage: Dict[str, int] = {}
 
-    def _post(self, method: str, payload: Dict) -> Dict:
+    @staticmethod
+    def _is_timeout_error(error: BaseException) -> bool:
+        if isinstance(error, (TimeoutError, socket.timeout)):
+            return True
+        if isinstance(error, URLError):
+            return GeminiAPIReader._is_timeout_error(error.reason)
+        return False
+
+    def _post_once(self, method: str, payload: Dict) -> Dict:
         url = f"{API_ROOT}/{quote(self.model, safe='')}:{method}"
         request = Request(
             url,
@@ -272,7 +295,33 @@ class GeminiAPIReader:
                 detail = body
             raise GeminiAPIError(exc.code, str(detail)) from exc
         except (URLError, TimeoutError, OSError) as exc:
-            raise GeminiAPIError(None, str(exc)) from exc
+            raise GeminiAPIError(
+                None,
+                str(exc),
+                retryable_timeout=self._is_timeout_error(exc),
+            ) from exc
+
+    def _post(
+        self,
+        method: str,
+        payload: Dict,
+        before_attempt: Optional[Callable[[], None]] = None,
+    ) -> Dict:
+        for attempt in range(1, self.max_attempts + 1):
+            if before_attempt is not None:
+                before_attempt()
+            try:
+                return self._post_once(method, payload)
+            except GeminiAPIError as exc:
+                retryable = exc.retryable_timeout or exc.status in (408, 504)
+                if not retryable or attempt == self.max_attempts:
+                    raise
+                delay = (2 ** (attempt - 1)) + random.uniform(0.0, 0.5)
+                print(
+                    f"Gemini {method} timed out; retrying attempt "
+                    f"{attempt + 1}/{self.max_attempts} in {delay:.1f}s..."
+                )
+                time.sleep(delay)
 
     @staticmethod
     def _contents(prompt: str) -> Dict:
@@ -290,7 +339,6 @@ class GeminiAPIReader:
 
     def generate(self, prompt: str) -> Tuple[str, float]:
         input_tokens = self.count_input_tokens(prompt)
-        self.guard.reserve_generation(input_tokens)
         generation_config = {"maxOutputTokens": self.max_new_tokens}
         if self.model.startswith("gemma-4-"):
             generation_config["thinkingConfig"] = {"thinkingLevel": "MINIMAL"}
@@ -299,7 +347,11 @@ class GeminiAPIReader:
             "generationConfig": generation_config,
         }
         started_at = time.perf_counter()
-        response = self._post("generateContent", payload)
+        response = self._post(
+            "generateContent",
+            payload,
+            before_attempt=lambda: self.guard.reserve_generation(input_tokens),
+        )
         elapsed = time.perf_counter() - started_at
         candidates = response.get("candidates") or []
         if not candidates:

@@ -53,6 +53,8 @@ class ExitRAG:
         gemini_project_id: Optional[str] = None,
         gemini_quota: Optional[GeminiQuota] = None,
         gemini_quota_state: Optional[Path] = None,
+        gemini_timeout_seconds: int = 300,
+        gemini_max_attempts: int = 3,
     ) -> None:
         """Load the optional paper compressor and downstream reader.
 
@@ -116,6 +118,8 @@ class ExitRAG:
                 quota=gemini_quota,
                 quota_state_path=gemini_quota_state,
                 max_new_tokens=max_new_tokens,
+                timeout_seconds=gemini_timeout_seconds,
+                max_attempts=gemini_max_attempts,
             )
             self.reader_model_id = gemini_model
         else:

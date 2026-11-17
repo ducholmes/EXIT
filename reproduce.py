@@ -280,6 +280,8 @@ def main() -> None:
     gemini_project_id = None
     gemini_quota = None
     quota_state_path = None
+    gemini_timeout_seconds = 300
+    gemini_max_attempts = 3
     if args.reader_backend == "gemini":
         if args.gemini_config is None:
             raise ValueError("--gemini-config is required with --reader-backend gemini")
@@ -297,6 +299,16 @@ def main() -> None:
         if not isinstance(quota_values, dict):
             raise ValueError("Gemini config needs a 'quotas' object")
         gemini_quota = GeminiQuota.from_mapping(quota_values)
+        gemini_timeout_seconds = gemini_config.get("timeout_seconds", 300)
+        gemini_max_attempts = gemini_config.get("max_attempts", 3)
+        for key, value in (
+            ("timeout_seconds", gemini_timeout_seconds),
+            ("max_attempts", gemini_max_attempts),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(
+                    f"Gemini config '{key}' must be a positive integer"
+                )
         configured_state = gemini_config.get("quota_state")
         quota_state_path = args.gemini_quota_state or (
             Path(configured_state) if configured_state else None
@@ -324,6 +336,8 @@ def main() -> None:
         gemini_project_id=gemini_project_id,
         gemini_quota=gemini_quota,
         gemini_quota_state=quota_state_path,
+        gemini_timeout_seconds=gemini_timeout_seconds,
+        gemini_max_attempts=gemini_max_attempts,
     )
 
     if args.warmup_runs:
@@ -559,6 +573,19 @@ def main() -> None:
             "top_p": 1.0 if args.reader_backend == "transformers" else None,
             "thinking_level": "MINIMAL" if args.reader_backend == "gemini" else None,
             "max_new_tokens": args.max_new_tokens,
+            "gemini_request": (
+                {
+                    "timeout_seconds": gemini_timeout_seconds,
+                    "max_attempts": gemini_max_attempts,
+                    "retry_backoff_initial_seconds": 2,
+                    "retry_backoff_multiplier": 2,
+                    "retry_jitter_max_seconds": 0.5,
+                    "retryable_http_statuses": [408, 504],
+                    "retryable_transport_errors": ["timeouts"],
+                }
+                if args.reader_backend == "gemini"
+                else None
+            ),
             "compressor_4bit": not args.no_4bit if rag.use_compressor else None,
             "gemini_quota": (
                 {

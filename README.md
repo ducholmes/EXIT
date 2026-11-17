@@ -174,7 +174,9 @@ in that model's RPM, input TPM, and RPD values from AI Studio. The runner uses
 80% of each configured limit, counts input tokens before each generation call, stores usage state, and
 pauses when its safe daily budget is reached. Set `GEMINI_API_KEY` in the
 environment. Keep using the same quota state file for both runs so usage is
-shared between them.
+shared between them. Optional `timeout_seconds` and `max_attempts` fields in
+the Gemini config control the per-request timeout and total attempts; defaults
+are 300 seconds and 3 attempts.
 
 Run the two conditions on the identical input with `--top-k 10`:
 
