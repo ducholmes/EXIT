@@ -36,6 +36,10 @@ class FakeBackend:
         self.processing_polls = 0
         self.failed_processing = False
         self.private = False
+        self.access_calls = 0
+
+    def check_access(self, owner):
+        self.access_calls += 1
 
     def info(self, ref):
         versions = self.datasets.get(ref)
@@ -335,10 +339,8 @@ def test_checkpoint_allowlist_excludes_credentials(tmp_path):
     (flow.work / 'raw-archive.tar').write_bytes(b'raw data')
     (flow.work / 'trained').mkdir()
     (flow.work / 'trained/index.faiss').write_bytes(b'incomplete training')
-    flow.publish_checkpoint()
-    uploaded = backend.datasets[store.ref('checkpoint')][0]['folder']
-    assert {p.name for p in uploaded.iterdir()} == {'snapshot.json', 'dataset-metadata.json'}
-    assert 'secret' not in (uploaded / 'snapshot.json').read_text()
+    assert flow.publish_checkpoint() is False
+    assert not backend.datasets  # no useful processed payload to save
 
 
 def test_faiss_does_not_checkpoint_each_shard(tmp_path, monkeypatch):
@@ -373,3 +375,136 @@ def test_faiss_does_not_checkpoint_each_shard(tmp_path, monkeypatch):
     prepare.build(args, lambda: False)
     assert len(checkpoints) == 1
     assert checkpoints[0]['shard'] == 2  # completion only, no per-shard serializations
+
+
+def test_api_check_create_update_and_same_process_cache(tmp_path):
+    config = configuration(tmp_path)
+    store, backend, clock = storage(config, tmp_path)
+    flow = Workflow(config, store, clock)
+    first = flow.check_api()
+    assert first['status'] == 'ok' and first['version'] == 1
+    assert first['dataset'] == store.ref('api-check')
+    assert flow.check_api() == first
+    assert backend.access_calls == 1
+    # A fresh resume process must prove read/write access again.
+    second = Workflow(config, store, clock).check_api()
+    assert second['version'] == 2 and backend.access_calls == 2
+    uploaded = backend.datasets[store.ref('api-check')][-1]['folder']
+    assert {p.name for p in uploaded.iterdir()} == {'probe.json', 'snapshot.json', 'dataset-metadata.json'}
+    assert inspect(config)['api_check']['version'] == 2
+
+
+def test_api_probe_corruption_is_not_success(tmp_path):
+    config = configuration(tmp_path)
+    store, backend, clock = storage(config, tmp_path)
+    fetch = backend.fetch
+    def corrupt(ref, version, name, folder):
+        path = fetch(ref, version, name, folder)
+        if name == 'probe.json':
+            path.write_text('{"wrong":true}')
+        return path
+    backend.fetch = corrupt
+    with pytest.raises(ValueError, match='does not match'):
+        Workflow(config, store, clock).check_api()
+    assert inspect(config)['api_check']['status'] == 'failed'
+    assert list((Path(config['root']) / 'uploads').glob('api-check-*/snapshot.json'))
+
+
+def test_api_denied_stops_before_any_heavy_work(tmp_path, monkeypatch):
+    config = configuration(tmp_path)
+    store, backend, clock = storage(config, tmp_path)
+    def denied(owner):
+        raise PermissionError('missing permissions')
+    backend.check_access = denied
+    monkeypatch.setattr(prepare, 'download', lambda *a, **kw: pytest.fail('must not download before API check succeeds'))
+    with pytest.raises(PermissionError):
+        Workflow(config, store, clock).run()
+    assert backend.upload_calls == 0
+    assert inspect(config)['api_check']['status'] == 'failed'
+
+
+def test_api_probe_timeout(tmp_path):
+    config = configuration(tmp_path)
+    config['api_check_timeout_minutes'] = 0.1
+    store, backend, clock = storage(config, tmp_path)
+    backend.processing_polls = 100
+    with pytest.raises(RuntimeError, match='not confirmed'):
+        Workflow(config, store, clock).check_api()
+    assert inspect(config)['api_check']['status'] == 'failed'
+
+
+def test_http_permissions_not_retried_but_429_is(tmp_path):
+    from types import SimpleNamespace
+    class HTTPError(Exception):
+        def __init__(self, status):
+            self.response = SimpleNamespace(status_code=status)
+    config = configuration(tmp_path)
+    store, backend, _ = storage(config, tmp_path)
+    folder = snapshot_fixture(config, tmp_path)
+    calls = []
+    upload = backend.upload
+    def forbidden(*args):
+        calls.append(True)
+        raise HTTPError(403)
+    backend.upload = forbidden
+    with pytest.raises(PermissionError, match='HTTP 403'):
+        store.publish(folder)
+    assert len(calls) == 1
+    def rate_limited(*args):
+        calls.append(True)
+        if len(calls) == 2:
+            raise HTTPError(429)
+        return upload(*args)
+    backend.upload = rate_limited
+    assert store.publish(folder)['version'] == 1
+    assert len(calls) == 3
+
+
+def test_download_only_never_publishes_checkpoint_even_at_budget(tmp_path, monkeypatch):
+    config = configuration(tmp_path)
+    store, backend, clock = storage(config, tmp_path)
+    flow = Workflow(config, store, clock)
+    flow.registry['error'] = 'HTTPError'  # a failure from the previous implementation
+    flow.save_registry()
+    def download(url, target, deadline, on_progress=None):
+        clock.value = 7200
+        on_progress({'bytes': 123})
+        clock.value = 36000
+        on_progress({'bytes': 456})
+    monkeypatch.setattr(prepare, 'download', download)
+    flow.run()
+    assert set(backend.datasets) == {store.ref('api-check')}
+    assert not (flow.root / 'remote.json').exists()
+
+
+def test_source_completion_does_not_publish_checkpoint(tmp_path, monkeypatch):
+    from retrieval import workflow
+    config = configuration(tmp_path)
+    store, backend, clock = storage(config, tmp_path)
+    flow = Workflow(config, store, clock)
+    reports = iter([{'next_step': 'download-corpus'}, {'next_step': 'extract-corpus'}, {'next_step': None}])
+    monkeypatch.setattr(workflow, 'inspect', lambda cfg: next(reports))
+    monkeypatch.setattr(prepare, 'download', lambda *a, **kw: None)
+    monkeypatch.setattr(prepare, 'extract', lambda *a, **kw: None)
+    flow.run()
+    assert set(backend.datasets) == {store.ref('api-check')}
+
+
+def test_registry_changes_do_not_create_checkpoint_version(tmp_path):
+    config = configuration(tmp_path)
+    store, backend, _ = storage(config, tmp_path)
+    flow = Workflow(config, store)
+    state = {'next_shard': 1, 'offset': 0, 'shards': [{'name': 'wiki_00'}], 'seen': 300,
+             'size': 300, 'dimension': 8, 'seed': 42, 'sample': np.zeros((300, 8)), 'rng': {}}
+    prepare.save_sample(flow.work / 'sample.pkl', state)
+    assert flow.publish_checkpoint()
+    calls = backend.upload_calls
+    flow.registry.update(current='verify', completed=['download-corpus', 'verify'], progress={'timestamp': 'new'})
+    flow.save_registry()
+    assert not flow.publish_checkpoint()
+    assert backend.upload_calls == calls
+    # A meaningful position change is saved.
+    state.update(offset=123, seen=423)
+    prepare.save_sample(flow.work / 'sample.pkl', state)
+    assert flow.publish_checkpoint()
+    assert backend.upload_calls == calls + 1

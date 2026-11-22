@@ -7,6 +7,7 @@ import sqlite3
 import tempfile
 import time
 import zipfile
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -15,6 +16,24 @@ from .storage import digest, write_json
 
 def utc_now():
     return datetime.now(timezone.utc).isoformat()
+
+
+def http_status(exc):
+    seen = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        status = getattr(getattr(exc, 'response', None), 'status_code', None)
+        if status is not None:
+            return status
+        exc = exc.__cause__
+    return None
+
+
+def transient(exc):
+    status = http_status(exc)
+    if status is not None:
+        return status == 429 or 500 <= status < 600
+    return isinstance(exc, (ConnectionError, TimeoutError, OSError))
 
 
 class KaggleBackend:
@@ -27,6 +46,13 @@ class KaggleBackend:
         from kaggle.api.kaggle_api_extended import KaggleApi
         self.api = KaggleApi()
         self.api.authenticate()
+
+    def check_access(self, owner):
+        known_owner = getattr(self.api, 'config_values', {}).get('username')
+        if known_owner and known_owner.lower() != owner.lower():
+            raise PermissionError(f'Configured owner {owner} differs from authenticated account {known_owner}')
+        if self.api.dataset_list(mine=True, page=1) is None:
+            raise PermissionError('Kaggle did not return an authenticated Dataset listing')
 
     def _get_dataset(self, ref):
         from kagglesdk.datasets.types.dataset_api_service import ApiGetDatasetRequest
@@ -62,6 +88,8 @@ class KaggleBackend:
                 except PermissionError:
                     raise
                 except Exception as listing_error:
+                    if transient(listing_error):
+                        raise
                     raise PermissionError('Kaggle denied Dataset access. Reload a personal KAGGLE_API_TOKEN from Secrets '
                                           'and confirm config owner matches that account.') from listing_error
             if status == 401:
@@ -117,6 +145,47 @@ class DatasetStore:
     def ref(self, kind):
         return f"{self.config['owner']}/{self.config['dataset_prefix']}-{kind}"
 
+    def check_api(self):
+        """Prove authenticated listing, writing and exact-version reading work."""
+        print('API CHECK: checking authenticated Dataset listing', flush=True)
+        for attempt in range(3):
+            try:
+                self.backend.check_access(self.config['owner'])
+                break
+            except Exception as exc:
+                if http_status(exc) in (401, 403):
+                    raise PermissionError(f'API CHECK: authenticated listing denied (HTTP {http_status(exc)}); '
+                                          'check Secrets token and config owner') from exc
+                if not transient(exc) or attempt == 2:
+                    raise
+                self.sleep(5 * 2 ** attempt)
+        root = Path(self.config['root'])
+        root.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix='api-probe-', dir=root) as temporary:
+            temporary = Path(temporary)
+            probe = {'probe_id': uuid.uuid4().hex, 'purpose': 'EXIT Kaggle API read/write check'}
+            write_json(temporary / 'probe.json', probe)
+            folder = make_snapshot(self.config, 'api-check', {'probe.json': (temporary / 'probe.json', 'probe.json')},
+                                   {'purpose': 'api-check'})
+            receipt = self.publish(folder, timeout_minutes=self.config.get('api_check_timeout_minutes', 10))
+            print('API CHECK: reading probe from confirmed Dataset version', flush=True)
+            for attempt in range(3):
+                try:
+                    returned = self.backend.fetch(receipt['dataset'], receipt['version'], 'probe.json', temporary)
+                    if json.loads(returned.read_text(encoding='utf-8')) != probe:
+                        raise ValueError('API CHECK failed: downloaded probe does not match uploaded content')
+                    break
+                except Exception as exc:
+                    if http_status(exc) in (401, 403):
+                        raise PermissionError(f'API CHECK: read-back denied for {receipt["dataset"]} '
+                                              f'(HTTP {http_status(exc)})') from exc
+                    if not transient(exc) or attempt == 2:
+                        raise
+                    self.sleep(5 * 2 ** attempt)
+            shutil.rmtree(folder)
+        print('API CHECK: API OK (authenticated listing + upload + verified read-back)', flush=True)
+        return {**receipt, 'status': 'ok', 'checks': ['authenticated-listing', 'upload', 'read-back']}
+
     def _remote_snapshot(self, ref, version):
         with tempfile.TemporaryDirectory(prefix='inspect-', dir=self.config['root']) as folder:
             path = self.backend.fetch(ref, version, 'snapshot.json', Path(folder))
@@ -141,7 +210,7 @@ class DatasetStore:
                 raise ValueError(f'{ref} belongs to a different retrieval configuration; choose another prefix')
         return None
 
-    def publish(self, folder):
+    def publish(self, folder, timeout_minutes=None):
         """Never mark durable before the exact snapshot is downloadable and ready."""
         manifest = json.loads((folder / 'snapshot.json').read_text(encoding='utf-8'))
         ref = self.ref(manifest['kind'])
@@ -159,7 +228,7 @@ class DatasetStore:
                 'Embeddings are the official Contriever-MSMARCO artifacts. '
                 'This Dataset contains selected retrieval state, not credentials or raw downloads.')})
         started = self.clock()
-        timeout = self.config.get('upload_timeout_minutes', 90) * 60
+        timeout = (timeout_minutes if timeout_minutes is not None else self.config.get('upload_timeout_minutes', 90)) * 60
         last_error = None
         for attempt in range(3):
             try:
@@ -178,7 +247,8 @@ class DatasetStore:
                         info = self.backend.info(ref)
                     version = self._matching_version(ref, info, manifest['snapshot_id']) if info else None
                     if version is None:
-                        print(f'Uploading {manifest["kind"]}: {total / 1024**3:.2f} GiB to {ref}', flush=True)
+                        label = 'API CHECK' if manifest['kind'] == 'api-check' else 'ARTIFACT UPLOAD' if manifest['kind'] == 'artifact' else 'CHECKPOINT UPLOAD'
+                        print(f'{label}: {manifest["kind"]}, {total / 1024**3:.2f} GiB to {ref}', flush=True)
                         self.backend.upload(ref, folder, bool(info), manifest['snapshot_id'])
                 while True:
                     info = self.backend.info(ref)
@@ -198,11 +268,14 @@ class DatasetStore:
                 raise
             except Exception as exc:
                 if getattr(getattr(exc, 'response', None), 'status_code', None) in (401, 403):
-                    raise PermissionError('Kaggle denied this operation; check personal token permissions and Dataset owner. '
+                    raise PermissionError(f'Kaggle denied access to {ref} (HTTP {http_status(exc)}); '
+                                          'check personal token permissions and Dataset owner. '
                                           f'Local snapshot retained at {folder}') from exc
                 last_error = exc
                 # Persist only exception type in public state; never raw HTTP/credential data.
                 print(f'Upload attempt {attempt + 1}/3 failed ({type(exc).__name__}); snapshot retained at {folder}', flush=True)
+                if not transient(exc):
+                    break
                 if self.clock() - started >= timeout:
                     break
                 if attempt < 2:

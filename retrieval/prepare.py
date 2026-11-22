@@ -292,11 +292,11 @@ def verify(path):
 
 def main():
     import sys
-    if len(sys.argv) > 1 and sys.argv[1] in ('status', 'resume', 'checkpoint', 'restore'):
+    if len(sys.argv) > 1 and sys.argv[1] in ('check-api', 'status', 'resume', 'checkpoint', 'restore'):
         from .workflow import main as workflow_main
         return workflow_main()
     parser = argparse.ArgumentParser(description=__doc__,
-        epilog='Automatic workflow: status / resume / checkpoint / restore --config CONFIG.json')
+        epilog='Automatic workflow: check-api / status / resume / checkpoint / restore --config CONFIG.json')
     parser.add_argument('step', choices=['preflight', 'download', 'extract', 'prepare-corpus', 'sample-pq', 'train-pq', 'build-index', 'verify'])
     parser.add_argument('--work', type=Path, default=Path('data/retrieval/work'))
     parser.add_argument('--output', type=Path, default=Path('data/retrieval/artifact'))

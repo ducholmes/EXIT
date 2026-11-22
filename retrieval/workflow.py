@@ -14,17 +14,18 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from . import prepare
-from .kaggle_store import DatasetStore, make_snapshot, restore_snapshot, utc_now
-from .storage import prepare_corpus, write_json
+from .kaggle_store import DatasetStore, http_status, make_snapshot, restore_snapshot, utc_now
+from .storage import digest, prepare_corpus, write_json
 
 DEFAULTS = {'root': '/tmp/retrieval-state', 'downloads': '/tmp/retrieval-downloads',
             'sources': '/tmp/retrieval-sources', 'dimension': 768, 'pq_m': 96,
             'bits': 8, 'sample_size': 100000, 'seed': 42, 'batch_size': 50000,
             'threads': 4, 'checkpoint_minutes': 120, 'time_budget_minutes': 600,
-            'upload_timeout_minutes': 90, 'license': 'other'}
+            'upload_timeout_minutes': 90, 'api_check_timeout_minutes': 10, 'license': 'other'}
 SETTINGS = ('dimension', 'pq_m', 'bits', 'sample_size', 'seed')
 STEPS = ('download-corpus', 'extract-corpus', 'download-embeddings', 'extract-embeddings',
          'prepare-corpus', 'sample-pq', 'train-pq', 'build-index', 'verify', 'publish-artifact')
+SAVE_AFTER = {'prepare-corpus', 'sample-pq', 'train-pq', 'build-index', 'publish-artifact'}
 
 
 def load_config(path):
@@ -43,7 +44,7 @@ def load_config(path):
     if config.get('public', True) is not True:
         raise ValueError('This workflow is configured for public Datasets only')
     if any(config[k] <= 0 for k in ('dimension', 'pq_m', 'sample_size', 'batch_size', 'threads',
-                                   'checkpoint_minutes', 'time_budget_minutes', 'upload_timeout_minutes')):
+                                   'checkpoint_minutes', 'time_budget_minutes', 'upload_timeout_minutes', 'api_check_timeout_minutes')):
         raise ValueError('Sizes, intervals and budgets must be positive')
     if config['dimension'] % config['pq_m'] or not 1 <= config['bits'] <= 16:
         raise ValueError('Invalid PQ configuration')
@@ -189,6 +190,7 @@ def inspect(config):
             'corpus': corpus, 'sampling': sampled, 'index': {k: v for k, v in indexed.items() if k != 'identity'},
             'local_checkpoint': str(generation) if generation else None, 'remote': remote,
             'last_progress': registry.get('progress'), 'last_error': registry.get('error'),
+            'api_check': read_json(root / 'api-check.json'),
             'next_checkpoint_at': registry.get('next_checkpoint_at'),
             'checkpoint_interval_minutes': config['checkpoint_minutes'],
             'limitations': 'Training, pickle decoding, hashing and individual file extraction cannot checkpoint mid-operation.'}
@@ -202,6 +204,8 @@ class Workflow:
         self.work = self.root / 'work'
         self.work.mkdir(exist_ok=True)
         self.store = store or DatasetStore(config)
+        self._api_checked = False
+        self._digest_cache = {}
         self.started = self.last_checkpoint = clock()
         self.registry = read_json(self.root / 'pipeline.json', {'config_id': config['config_id'], 'completed': []})
         if self.registry['config_id'] != config['config_id']:
@@ -222,8 +226,12 @@ class Workflow:
         self.registry['progress'] = progress
         self.save_registry()
         if self.clock() - self.last_checkpoint >= self.config['checkpoint_minutes'] * 60:
-            save()
-            self.publish_checkpoint()
+            current = self.registry.get('current') or ''
+            if current.startswith(('download-', 'extract-')):
+                self._skip_checkpoint('only download/extraction progress; raw sources are not uploaded')
+            else:
+                save()
+                self.publish_checkpoint()
         if self.deadline():
             save()
             raise BudgetReached()
@@ -232,46 +240,97 @@ class Workflow:
         return SimpleNamespace(**{**self.config, 'work': self.work, 'corpus': self.root / 'corpus.sqlite',
                                   'output': self.root / 'artifact', 'shards': shard_pattern(self.config), 'control': self})
 
-    def _progress(self):
+    def _progress(self, payload_id=None):
         return {'config_id': self.config['config_id'], 'completed': self.registry['completed'],
                 'current': self.registry.get('current'), 'progress': self.registry.get('progress'),
-                'artifact_ref': read_json(self.root / 'remote.json').get('artifact')}
+                'artifact_ref': read_json(self.root / 'remote.json').get('artifact'), 'payload_id': payload_id}
+
+    def _skip_checkpoint(self, reason):
+        print('CHECKPOINT SKIP: ' + reason, flush=True)
+        self.last_checkpoint = self.clock()
+        self._set_next_checkpoint()
+        self.save_registry()
+        return False
+
+    def check_api(self):
+        if self._api_checked:
+            return read_json(self.root / 'api-check.json')
+        try:
+            result = self.store.check_api()
+        except Exception as exc:
+            write_json(self.root / 'api-check.json', {'status': 'failed', 'checked_at': utc_now(),
+                       'error_type': type(exc).__name__, 'http_status': http_status(exc),
+                       'dataset': self.store.ref('api-check')})
+            print('API CHECK FAILED: no download or processing was started by resume.', flush=True)
+            raise
+        write_json(self.root / 'api-check.json', result)
+        self._api_checked = True
+        self.last_checkpoint = self.clock()
+        self._set_next_checkpoint()
+        return result
+
+    def _checkpoint_files(self):
+        files = {}
+        sampled = sample_progress(self.root)
+        if sampled.get('seen', 0) > 0:
+            for name, path in (('sample.pkl', 'sample.pkl'), ('sample-progress.json', 'sample.json')):
+                if (self.work / path).exists():
+                    files[name] = (self.work / path, 'work/' + path)
+        trained = self.work / 'trained'
+        if all((trained / name).exists() for name in ('index.faiss', 'index_meta.faiss', 'complete.json')):
+            for name, path in (('trained-index.faiss', 'index.faiss'), ('trained-meta.faiss', 'index_meta.faiss'),
+                               ('trained-complete.json', 'complete.json')):
+                files[name] = (trained / path, 'work/trained/' + path)
+        generation = prepare.latest_checkpoint(self.work)
+        if generation:
+            state = read_json(generation / 'complete.json')
+            if state.get('vectors', 0) > 0 or state.get('shard', 0) > 0 or state.get('offset', 0) > 0:
+                for name in ('index.faiss', 'index_meta.faiss', 'complete.json'):
+                    files['checkpoint-' + name] = (generation / name, f'work/checkpoints/{generation.name}/{name}')
+        return files
+
+    def _file_digest(self, path):
+        stat = path.stat()
+        key = (str(path.resolve()), stat.st_size, stat.st_mtime_ns)
+        if key not in self._digest_cache:
+            self._digest_cache[key] = digest(path)
+        return self._digest_cache[key]
 
     def publish_checkpoint(self):
         """Upload only durable corpus/work data, with exact cross-Dataset references."""
         remote = read_json(self.root / 'remote.json')
         corpus = corpus_progress(self.root)
-        if corpus:
+        files = self._checkpoint_files()
+        has_corpus = corpus.get('count', 0) > 0
+        if not has_corpus and not files:
+            return self._skip_checkpoint('no processed data; only download/extraction or empty pipeline state')
+        corpus_identity = hashlib.sha256(json.dumps(corpus, sort_keys=True).encode()).hexdigest() if has_corpus else None
+        artifact_ref = remote.get('artifact', {})
+        payload = {'corpus_identity': corpus_identity,
+                   'files': {name: self._file_digest(value[0]) for name, value in files.items()},
+                   'artifact': {k: artifact_ref.get(k) for k in ('dataset', 'version', 'snapshot_id')}}
+        payload_id = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+        if remote.get('checkpoint_payload_id') == payload_id:
+            return self._skip_checkpoint('processed data and resume position have not changed')
+        if has_corpus:
             # Row count + source + offset identify a committed import revision.
-            corpus_identity = hashlib.sha256(json.dumps(corpus, sort_keys=True).encode()).hexdigest()
             if remote.get('corpus_identity') != corpus_identity:
                 folder = make_snapshot(self.config, 'corpus', {'corpus.sqlite': (self.root / 'corpus.sqlite', 'corpus.sqlite')}, corpus)
                 remote['corpus'] = self.store.publish(folder)
                 remote['corpus_identity'] = corpus_identity
                 write_json(self.root / 'remote.json', remote)
                 shutil.rmtree(folder)
-        files = {}
-        for name, path, destination in (
-                ('sample.pkl', self.work / 'sample.pkl', 'work/sample.pkl'),
-                ('sample-progress.json', self.work / 'sample.json', 'work/sample.json'),
-                ('trained-index.faiss', self.work / 'trained/index.faiss', 'work/trained/index.faiss'),
-                ('trained-meta.faiss', self.work / 'trained/index_meta.faiss', 'work/trained/index_meta.faiss'),
-                ('trained-complete.json', self.work / 'trained/complete.json', 'work/trained/complete.json')):
-            if path.exists() and (not name.startswith('trained-') or (self.work / 'trained/complete.json').exists()):
-                files[name] = (path, destination)
-        generation = prepare.latest_checkpoint(self.work)
-        if generation:
-            for name in ('index.faiss', 'index_meta.faiss', 'complete.json'):
-                files['checkpoint-' + name] = (generation / name, f'work/checkpoints/{generation.name}/{name}')
-        folder = make_snapshot(self.config, 'checkpoint', files, self._progress(), remote.get('corpus'))
+        folder = make_snapshot(self.config, 'checkpoint', files, self._progress(payload_id), remote.get('corpus'))
         if remote.get('checkpoint', {}).get('snapshot_id') != read_json(folder / 'snapshot.json')['snapshot_id']:
             remote['checkpoint'] = self.store.publish(folder)
-            write_json(self.root / 'remote.json', remote)
+        remote['checkpoint_payload_id'] = payload_id
+        write_json(self.root / 'remote.json', remote)
         shutil.rmtree(folder)
         self.last_checkpoint = self.clock()
         self._set_next_checkpoint()
         self.save_registry()
         print(f'Next periodic checkpoint in {self.config["checkpoint_minutes"]} minutes', flush=True)
+        return True
 
     def publish_artifact(self):
         directory = self.root / 'artifact'
@@ -285,12 +344,14 @@ class Workflow:
         shutil.rmtree(folder)
 
     def run(self):
+        self.check_api()
         import faiss
         faiss.omp_set_num_threads(self.config['threads'])
-        # Recover a prior upload failure before changing any more local state.
+        # Only meaningful unsaved payload is retried, never download-only state.
         if self.registry.get('error'):
             self.publish_checkpoint()
             self.registry.pop('error', None)
+            self.save_registry()
         while True:
             report = inspect(self.config)
             step = report['next_step']
@@ -344,10 +405,13 @@ class Workflow:
                     self.registry['completed'].append(step)
                 self.registry.update(current=None, progress=None)
                 self.save_registry()
-                self.publish_checkpoint()
+                if step in SAVE_AFTER:
+                    self.publish_checkpoint()
+                elif step.startswith(('download-', 'extract-')):
+                    print('CHECKPOINT SKIP: source step completed; progress is local-only', flush=True)
             except BudgetReached:
                 self.publish_checkpoint()
-                print('Time budget reached; saved. Use restore → status → resume next session.', flush=True)
+                print('Time budget reached. Check status for confirmed remote saves; raw sources remain local.', flush=True)
                 return
             except Exception as exc:
                 self.registry['error'] = type(exc).__name__
@@ -404,6 +468,8 @@ def restore(config, store=None):
                                                        local_folder=config.get('corpus_input'))
         remote['corpus_identity'] = hashlib.sha256(json.dumps(corpus_manifest['progress'], sort_keys=True).encode()).hexdigest()
     progress = manifest['progress']
+    if progress.get('payload_id'):
+        remote['checkpoint_payload_id'] = progress['payload_id']
     if progress.get('artifact_ref'):
         ref = progress['artifact_ref']
         if ref['dataset'] != store.ref('artifact'):
@@ -416,7 +482,7 @@ def restore(config, store=None):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('step', choices=['status', 'resume', 'checkpoint', 'restore'])
+    parser.add_argument('step', choices=['check-api', 'status', 'resume', 'checkpoint', 'restore'])
     parser.add_argument('--config', type=Path, required=True)
     parser.add_argument('--json', action='store_true', help='Machine-readable status')
     args = parser.parse_args()
@@ -434,12 +500,15 @@ def main():
             print('Corpus passages:', result['corpus'].get('count', 0))
             print('Sampling progress:', {k: result['sampling'].get(k) for k in ('next_shard', 'offset', 'seen')})
             print('Last confirmed remote saves:', json.dumps(result['remote'], indent=2))
+            print('Last API check:', json.dumps(result['api_check'], indent=2))
             print('Next checkpoint due (active run):', result['next_checkpoint_at'])
             print(result['limitations'])
     elif args.step == 'restore':
         restore(config)
     elif args.step == 'checkpoint':
         Workflow(config).publish_checkpoint()
+    elif args.step == 'check-api':
+        Workflow(config).check_api()
     else:
         Workflow(config).run()
 

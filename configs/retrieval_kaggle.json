@@ -15,5 +15,6 @@
   "checkpoint_minutes": 120,
   "time_budget_minutes": 600,
   "upload_timeout_minutes": 90,
+  "api_check_timeout_minutes": 10,
   "license": "other"
 }
