@@ -20,21 +20,52 @@ def utc_now():
 class KaggleBackend:
     """Small official-client adapter, replaceable by a fake in offline tests."""
     def __init__(self):
+        # The SDK otherwise prefers Kaggle's notebook token file over an explicit
+        # personal token. Scope this change to the uploader process, not the notebook.
+        if os.environ.get('KAGGLE_API_TOKEN'):
+            os.environ.pop('KAGGLE_API_V1_TOKEN', None)
         from kaggle.api.kaggle_api_extended import KaggleApi
         self.api = KaggleApi()
         self.api.authenticate()
 
-    def info(self, ref):
+    def _get_dataset(self, ref):
         from kagglesdk.datasets.types.dataset_api_service import ApiGetDatasetRequest
         owner, slug = ref.split('/')
         request = ApiGetDatasetRequest()
         request.owner_slug, request.dataset_slug = owner, slug
+        with self.api.build_kaggle_client() as client:
+            return client.datasets.dataset_api_client.get_dataset(request)
+
+    def info(self, ref):
         try:
-            with self.api.build_kaggle_client() as client:
-                result = client.datasets.dataset_api_client.get_dataset(request)
+            result = self._get_dataset(ref)
         except Exception as exc:
-            if getattr(getattr(exc, 'response', None), 'status_code', None) == 404:
+            status = getattr(getattr(exc, 'response', None), 'status_code', None)
+            if status == 404:
                 return None
+            if status == 403:
+                # Some Kaggle endpoints hide a missing Dataset behind Forbidden.
+                # Confirm absence using the authenticated owner's listing; never
+                # blindly treat every permission error as "does not exist".
+                try:
+                    page = 1
+                    while True:
+                        rows = self.api.dataset_list(mine=True, page=page)
+                        if rows is None:
+                            raise PermissionError('Kaggle did not return an authenticated Dataset listing')
+                        if any(row and row.ref == ref for row in rows):
+                            raise PermissionError(f'Kaggle lists {ref} but denies reading it; check token permissions')
+                        if not rows:
+                            print(f'{ref} is absent from your Dataset listing; will create it.', flush=True)
+                            return None
+                        page += 1
+                except PermissionError:
+                    raise
+                except Exception as listing_error:
+                    raise PermissionError('Kaggle denied Dataset access. Reload a personal KAGGLE_API_TOKEN from Secrets '
+                                          'and confirm config owner matches that account.') from listing_error
+            if status == 401:
+                raise PermissionError('Kaggle authentication failed; reload KAGGLE_API_TOKEN from Secrets') from exc
             raise
         versions = [{'number': v.version_number, 'notes': v.version_notes, 'status': v.status}
                     for v in result.versions]
@@ -163,9 +194,12 @@ class DatasetStore:
                     if self.clock() - started >= timeout:
                         raise TimeoutError('Kaggle did not confirm the uploaded snapshot in time')
                     self.sleep(15)
-            except ValueError:
+            except (ValueError, PermissionError):
                 raise
             except Exception as exc:
+                if getattr(getattr(exc, 'response', None), 'status_code', None) in (401, 403):
+                    raise PermissionError('Kaggle denied this operation; check personal token permissions and Dataset owner. '
+                                          f'Local snapshot retained at {folder}') from exc
                 last_error = exc
                 # Persist only exception type in public state; never raw HTTP/credential data.
                 print(f'Upload attempt {attempt + 1}/3 failed ({type(exc).__name__}); snapshot retained at {folder}', flush=True)

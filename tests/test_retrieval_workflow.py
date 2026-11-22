@@ -155,6 +155,24 @@ def test_official_adapter_preserves_binary_and_public_flags(tmp_path):
     assert calls[1][1]['delete_old_versions'] is False
 
 
+def test_forbidden_missing_dataset_requires_authenticated_listing():
+    from types import SimpleNamespace
+    class HTTPError(Exception):
+        response = SimpleNamespace(status_code=403)
+    backend = KaggleBackend.__new__(KaggleBackend)
+    def forbidden(_):
+        raise HTTPError()
+    backend._get_dataset = forbidden
+    backend.api = SimpleNamespace(dataset_list=lambda **kw: [])
+    assert backend.info('owner/new-dataset') is None
+    backend.api = SimpleNamespace(dataset_list=lambda **kw: [SimpleNamespace(ref='owner/existing')])
+    with pytest.raises(PermissionError, match='denies reading'):
+        backend.info('owner/existing')
+    backend.api = SimpleNamespace(dataset_list=lambda **kw: forbidden(None))
+    with pytest.raises(PermissionError, match='personal KAGGLE_API_TOKEN'):
+        backend.info('owner/new-dataset')
+
+
 def test_retry_processing_visibility_and_size_limit(tmp_path):
     config = configuration(tmp_path)
     store, backend, clock = storage(config, tmp_path)
