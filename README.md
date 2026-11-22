@@ -1,5 +1,9 @@
 # EXIT: Context-Aware Extractive Compression for RAG
 
+For Contriever-MSMARCO retrieval with precomputed Wikipedia embeddings, resumable
+FAISS PQ preparation, SQLite storage, and Kaggle workflows, see
+[the retrieval guide](retrieval/README.md).
+
 [![arXiv](https://img.shields.io/badge/arXiv-2412.12559-b31b1b.svg)](https://arxiv.org/abs/2412.12559)
 
 Official implementation of **EXIT: Context-Aware Extractive Compression for

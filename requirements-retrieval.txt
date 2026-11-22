@@ -1,0 +1,7 @@
+# Artifact preparation and FAISS tests (PyTorch unnecessary for these steps).
+numpy>=1.24
+faiss-cpu>=1.7.4
+tqdm>=4.66
+huggingface-hub>=0.20
+transformers>=4.36
+# Install torch using the CUDA version provided by Kaggle for model inference.

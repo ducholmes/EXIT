@@ -23,16 +23,27 @@ class Indexer(object):
         self.index_id_to_db_id = []
 
     def index_data(self, ids, embeddings):
-        self._update_id_mapping(ids)
-        embeddings = embeddings.astype('float32')
+        embeddings = np.ascontiguousarray(embeddings, dtype='float32')
+        if embeddings.ndim != 2 or embeddings.shape != (len(ids), self.index.d):
+            raise ValueError('IDs and embedding dimensions do not match index')
+        if not np.isfinite(embeddings).all():
+            raise ValueError('Embeddings contain non-finite values')
         if not self.index.is_trained:
             self.index.train(embeddings)
         self.index.add(embeddings)
+        self._update_id_mapping(ids)
 
         print(f'Total data indexed {len(self.index_id_to_db_id)}')
 
     def search_knn(self, query_vectors: np.array, top_docs: int, index_batch_size: int = 2048) -> List[Tuple[List[object], List[float]]]:
-        query_vectors = query_vectors.astype('float32')
+        if top_docs <= 0 or index_batch_size <= 0:
+            raise ValueError('top_docs and index_batch_size must be positive')
+        query_vectors = np.ascontiguousarray(query_vectors, dtype='float32')
+        if query_vectors.ndim != 2 or query_vectors.shape[1] != self.index.d or not np.isfinite(query_vectors).all():
+            raise ValueError('Invalid query vectors')
+        if self.index.ntotal == 0:
+            return [([], []) for _ in query_vectors]
+        top_docs = min(top_docs, self.index.ntotal)
         result = []
         nbatch = (len(query_vectors)-1) // index_batch_size + 1
         for k in tqdm(range(nbatch)):
@@ -41,11 +52,15 @@ class Indexer(object):
             q = query_vectors[start_idx: end_idx]
             scores, indexes = self.index.search(q, top_docs)
             # convert to external ids
-            db_ids = [[str(self.index_id_to_db_id[i]) for i in query_top_idxs] for query_top_idxs in indexes]
-            result.extend([(db_ids[i], scores[i]) for i in range(len(db_ids))])
+            for row, row_scores in zip(indexes, scores):
+                valid = row >= 0
+                result.append(([str(self.index_id_to_db_id[i]) for i in row[valid]], row_scores[valid]))
         return result
 
     def serialize(self, dir_path):
+        if len(self.index_id_to_db_id) != self.index.ntotal:
+            raise ValueError('Index ID mapping is inconsistent')
+        os.makedirs(dir_path, exist_ok=True)
         index_file = os.path.join(dir_path, 'index.faiss')
         meta_file = os.path.join(dir_path, 'index_meta.faiss')
         print(f'Serializing index to {index_file}, meta data to {meta_file}')
@@ -60,12 +75,12 @@ class Indexer(object):
         print(f'Loading index from {index_file}, meta data from {meta_file}')
 
         self.index = faiss.read_index(index_file)
-        print('Loaded index of type %s and size %d', type(self.index), self.index.ntotal)
+        print(f'Loaded index of type {type(self.index)} and size {self.index.ntotal}')
 
         with open(meta_file, "rb") as reader:
             self.index_id_to_db_id = pickle.load(reader)
-        assert len(
-            self.index_id_to_db_id) == self.index.ntotal, 'Deserialized index_id_to_db_id should match faiss index size'
+        if len(self.index_id_to_db_id) != self.index.ntotal:
+            raise ValueError('Deserialized ID mapping does not match index size')
 
     def _update_id_mapping(self, db_ids: List):
         #new_ids = np.array(db_ids, dtype=np.int64)
