@@ -4,4 +4,5 @@ faiss-cpu>=1.7.4
 tqdm>=4.66
 huggingface-hub>=0.20
 transformers>=4.36
+kaggle>=2.2.5,<3
 # Install torch using the CUDA version provided by Kaggle for model inference.

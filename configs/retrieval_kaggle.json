@@ -1,0 +1,19 @@
+{
+  "owner": "YOUR_USERNAME",
+  "dataset_prefix": "exit-wikipedia-retrieval",
+  "public": true,
+  "root": "/tmp/retrieval-state",
+  "downloads": "/tmp/retrieval-downloads",
+  "sources": "/tmp/retrieval-sources",
+  "dimension": 768,
+  "pq_m": 96,
+  "bits": 8,
+  "sample_size": 100000,
+  "seed": 42,
+  "batch_size": 50000,
+  "threads": 4,
+  "checkpoint_minutes": 120,
+  "time_budget_minutes": 600,
+  "upload_timeout_minutes": 90,
+  "license": "other"
+}

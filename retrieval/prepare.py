@@ -19,7 +19,7 @@ SOURCES = {
 }
 
 
-def download(url, target, deadline):
+def download(url, target, deadline, on_progress=None):
     target = Path(target)
     if target.exists():
         return
@@ -43,6 +43,9 @@ def download(url, target, deadline):
                     break
                 out.write(block)
                 received += len(block)
+                if on_progress:
+                    out.flush()
+                    on_progress({'file': target.name, 'bytes': out.tell()})
                 if deadline():
                     return
         if expected is not None and received != int(expected):
@@ -51,7 +54,7 @@ def download(url, target, deadline):
     write_json(target.with_name(target.name + '.json'), {'url': url, 'sha256': digest(target)})
 
 
-def extract(source, output):
+def extract(source, output, on_progress=None):
     source, output = Path(source), Path(output)
     output.mkdir(parents=True, exist_ok=True)
     if source.suffix == '.gz':
@@ -61,6 +64,8 @@ def extract(source, output):
             with gzip.open(source, 'rb') as src, temporary.open('wb') as dst:
                 shutil.copyfileobj(src, dst, 8 * 1024 * 1024)
             os.replace(temporary, target)
+            if on_progress:
+                on_progress({'file': target.name})
     else:
         with tarfile.open(source) as archive:
             for member in archive:
@@ -77,6 +82,8 @@ def extract(source, output):
                 with archive.extractfile(member) as src, temporary.open('wb') as dst:
                     shutil.copyfileobj(src, dst, 8 * 1024 * 1024)
                 os.replace(temporary, target)
+                if on_progress:
+                    on_progress({'file': member.name})
 
 
 def load_shard(path, dimension):
@@ -102,6 +109,7 @@ def save_sample(path, state):
     with temporary.open('wb') as output:
         pickle.dump(state, output, protocol=pickle.HIGHEST_PROTOCOL)
     os.replace(temporary, path)
+    write_json(Path(path).with_suffix('.json'), {k: v for k, v in state.items() if k not in ('sample', 'rng')})
 
 
 def sample(args, deadline):
@@ -118,10 +126,12 @@ def sample(args, deadline):
         raise ValueError('Sampling configuration/source changed')
     rng = np.random.default_rng()
     rng.bit_generator.state = state['rng']
+    control = getattr(args, 'control', None)
     for i in range(state['next_shard'], len(paths)):
         _, vectors = load_shard(paths[i], args.dimension)
         # Vectorized reservoir updates, applying replacements in stream order.
-        for start in range(0, len(vectors), 50000):
+        first = state.get('offset', 0) if i == state['next_shard'] else 0
+        for start in range(first, len(vectors), 50000):
             block = vectors[start:start + 50000]
             seen = state['seen']
             fill = min(len(block), max(0, args.sample_size - seen))
@@ -132,11 +142,21 @@ def sample(args, deadline):
                 for row in np.flatnonzero(positions < args.sample_size):
                     state['sample'][positions[row]] = rest[row]
             state['seen'] += len(block)
-        state.update(next_shard=i + 1, rng=rng.bit_generator.state)
-        save_sample(state_path, state)
+            state.update(next_shard=i, offset=start + len(block), rng=rng.bit_generator.state)
+            save = lambda: save_sample(state_path, state)
+            if control:
+                control.tick(save, {'shard': i, 'offset': state['offset'], 'seen': state['seen']})
+            if deadline():
+                save()
+                return
+        state.update(next_shard=i + 1, offset=0, rng=rng.bit_generator.state)
+        if not control:
+            save_sample(state_path, state)
         del vectors
         if deadline():
+            save_sample(state_path, state)
             return
+    save_sample(state_path, state)
     print(f"Sample ready: {min(state['seen'], args.sample_size)} vectors")
 
 
@@ -164,7 +184,7 @@ def train(args):
 def latest_checkpoint(work):
     candidates = sorted((work / 'checkpoints').glob('generation-*'), reverse=True)
     for candidate in candidates:
-        if (candidate / 'complete.json').exists():
+        if all((candidate / name).exists() for name in ('complete.json', 'index.faiss', 'index_meta.faiss')):
             return candidate
     return None
 
@@ -209,6 +229,7 @@ def build(args, deadline):
         state = {'identity': identity, 'shard': 0, 'offset': 0,
                  'model_revision': model_info('facebook/contriever-msmarco').sha}
     saved_at = time.monotonic()
+    control = getattr(args, 'control', None)
     try:
         for i in range(state['shard'], len(paths)):
             ids, vectors = load_shard(paths[i], args.dimension)
@@ -217,16 +238,17 @@ def build(args, deadline):
                 end = min(offset + args.batch_size, len(ids))
                 corpus.get_many(ids[offset:end])
                 index.index_data(ids[offset:end], vectors[offset:end])
-                state.update(shard=i, offset=end)
-                if deadline() or time.monotonic() - saved_at >= args.checkpoint_minutes * 60:
+                state.update(shard=i, offset=end, vectors=index.index.ntotal)
+                if control:
+                    control.tick(lambda: checkpoint(index, args.work, state), dict(state, identity=None))
+                if deadline() or (not control and time.monotonic() - saved_at >= args.checkpoint_minutes * 60):
                     checkpoint(index, args.work, state)
                     saved_at = time.monotonic()
                     if deadline():
                         return
             state.update(shard=i + 1, offset=0)
-            checkpoint(index, args.work, state)
-            saved_at = time.monotonic()
             del ids, vectors
+        checkpoint(index, args.work, state)
         args.output.mkdir(parents=True, exist_ok=True)
         if (args.output / 'manifest.json').exists():
             raise ValueError('Output artifact already exists; select a new output directory')
@@ -269,7 +291,12 @@ def verify(path):
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] in ('status', 'resume', 'checkpoint', 'restore'):
+        from .workflow import main as workflow_main
+        return workflow_main()
+    parser = argparse.ArgumentParser(description=__doc__,
+        epilog='Automatic workflow: status / resume / checkpoint / restore --config CONFIG.json')
     parser.add_argument('step', choices=['preflight', 'download', 'extract', 'prepare-corpus', 'sample-pq', 'train-pq', 'build-index', 'verify'])
     parser.add_argument('--work', type=Path, default=Path('data/retrieval/work'))
     parser.add_argument('--output', type=Path, default=Path('data/retrieval/artifact'))
@@ -284,7 +311,7 @@ def main():
     parser.add_argument('--bits', type=int, default=8)
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--batch-size', type=int, default=50000)
-    parser.add_argument('--checkpoint-minutes', type=float, default=30)
+    parser.add_argument('--checkpoint-minutes', type=float, default=120)
     parser.add_argument('--time-budget-minutes', type=float, default=600)
     parser.add_argument('--threads', type=int, default=4)
     args = parser.parse_args()

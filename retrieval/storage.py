@@ -47,7 +47,7 @@ class Corpus:
         self.connection.close()
 
 
-def prepare_corpus(tsv, output, deadline=lambda: False, batch_size=10000):
+def prepare_corpus(tsv, output, deadline=lambda: False, batch_size=10000, on_progress=None):
     """Resume at CSV record boundaries; progress and rows commit together."""
     tsv, output = Path(tsv), Path(output)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -82,6 +82,8 @@ def prepare_corpus(tsv, output, deadline=lambda: False, batch_size=10000):
                         db.executemany('INSERT INTO passages VALUES(?,?,?)', rows)
                         db.execute('INSERT OR REPLACE INTO progress VALUES(?,?)', ('state', json.dumps(state)))
                     rows = []
+                    if on_progress:
+                        on_progress(dict(state))
                     if deadline():
                         return state
             state.update(offset=source.tell(), count=state['count'] + len(rows), complete=True)
