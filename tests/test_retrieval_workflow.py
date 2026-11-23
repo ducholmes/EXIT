@@ -361,6 +361,21 @@ def test_full_workflow_and_completed_artifact_restore(tmp_path, monkeypatch):
     assert inspect(restored_config)['next_step'] is None
     assert (Path(restored_config['root']) / 'artifact/index.faiss').exists()
     prepare.verify(Path(restored_config['root']) / 'artifact')
+    # Kaggle's mutable latest-version listing can lag after a successful publish.
+    # Restore the exact confirmed receipt rather than trusting that listing.
+    saved = json.loads((flow.root / 'remote.json').read_text())
+    original_info = backend.info
+    def stale_latest(ref):
+        info = original_info(ref)
+        if ref == store.ref('checkpoint'):
+            info['version'] = 1
+        return info
+    backend.info = stale_latest
+    pinned_config = configuration(tmp_path, 'pinned-session')
+    restore(pinned_config, DatasetStore(pinned_config, backend), checkpoint_ref=saved['checkpoint'])
+    prepare.verify(Path(pinned_config['root']) / 'artifact')
+    restored_receipt = json.loads((Path(pinned_config['root']) / 'remote.json').read_text())
+    assert restored_receipt['checkpoint']['version'] == saved['checkpoint']['version']
 
 
 def test_processing_timeout_does_not_report_success(tmp_path):

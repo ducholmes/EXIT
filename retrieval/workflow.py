@@ -433,7 +433,8 @@ class BudgetReached(Exception):
     pass
 
 
-def restore(config, store=None):
+def restore(config, store=None, checkpoint_ref=None):
+    """Restore latest state, or the exact confirmed receipt passed by a caller."""
     store = store or DatasetStore(config)
     root = Path(config['root'])
     root.mkdir(parents=True, exist_ok=True)
@@ -452,10 +453,12 @@ def restore(config, store=None):
                 def fetch(name, target):
                     shutil.copyfile(folder / name, target)
             else:
-                info = store.backend.info(ref)
-                if not info or not store._ready(info['status']):
-                    raise ValueError(f'Dataset missing or not ready: {ref}')
-                version = version or info['version']
+                if version is None:
+                    info = store.backend.info(ref)
+                    if not info or not store._ready(info['status']):
+                        raise ValueError(f'Dataset missing or not ready: {ref}')
+                    version = info['version']
+                print(f'RESTORE: {ref}, version {version}', flush=True)
                 manifest = read_json(store.backend.fetch(ref, version, 'snapshot.json', temporary))
                 def fetch(name, target):
                     source = store.backend.fetch(ref, version, name, temporary)
@@ -468,7 +471,17 @@ def restore(config, store=None):
             return manifest, {'dataset': ref, 'version': version, 'snapshot_id': manifest['snapshot_id'],
                               'restored_at': utc_now()}
 
-    manifest, remote['checkpoint'] = restore_one('checkpoint', local_folder=local)
+    if checkpoint_ref is not None:
+        if checkpoint_ref.get('dataset') != store.ref('checkpoint'):
+            raise ValueError('Pinned checkpoint Dataset differs from configured owner/prefix')
+        if not isinstance(checkpoint_ref.get('version'), int) or checkpoint_ref['version'] <= 0 or not checkpoint_ref.get('snapshot_id'):
+            raise ValueError('Pinned checkpoint needs a positive version and snapshot_id')
+    manifest, remote['checkpoint'] = restore_one('checkpoint',
+        version=checkpoint_ref['version'] if checkpoint_ref else None,
+        receipt=checkpoint_ref, local_folder=local)
+    if 'publish-artifact' in manifest['progress'].get('completed', []) and not manifest['progress'].get('artifact_ref'):
+        raise ValueError('Restored checkpoint marks artifact published but contains no artifact_ref; '
+                         'save a new checkpoint from the source state before verifying artifact files')
     corpus_ref = manifest.get('corpus_ref')
     if corpus_ref:
         if corpus_ref['dataset'] != store.ref('corpus'):
