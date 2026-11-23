@@ -177,6 +177,49 @@ def test_forbidden_missing_dataset_requires_authenticated_listing():
         backend.info('owner/new-dataset')
 
 
+def test_getdataset_forbidden_can_use_listing_and_status(tmp_path):
+    from types import SimpleNamespace
+    class HTTPError(Exception):
+        response = SimpleNamespace(status_code=403)
+    config = configuration(tmp_path)
+    fake = FakeBackend(tmp_path / 'remote')
+    backend = KaggleBackend.__new__(KaggleBackend)
+    def forbidden(ref):
+        raise HTTPError()
+    backend._get_dataset = forbidden
+    statuses = iter(['processing', 'ready', 'ready'])
+    def listing(**kwargs):
+        return [SimpleNamespace(ref=ref, is_private=False, current_version_number=len(versions))
+                for ref, versions in fake.datasets.items()]
+    backend.api = SimpleNamespace(config_values={}, dataset_list=listing, dataset_status=lambda ref: next(statuses, 'ready'))
+    backend.upload = fake.upload
+    backend.fetch = fake.fetch
+    clock = Clock()
+    store = DatasetStore(config, backend, clock, clock.sleep)
+    folder = snapshot_fixture(config, tmp_path)
+    assert store.publish(folder)['version'] == 1
+    assert clock.value >= 15
+    assert fake.upload_calls == 1
+
+
+def test_metadata_propagation_is_bounded_not_blind_success(tmp_path):
+    config = configuration(tmp_path)
+    store, backend, clock = storage(config, tmp_path)
+    folder = snapshot_fixture(config, tmp_path)
+    original = backend.info
+    def pending(ref):
+        info = original(ref)
+        if info:
+            info['status'] = 'metadata_pending'
+        return info
+    backend.info = pending
+    with pytest.raises(PermissionError, match='propagation wait'):
+        store.publish(folder)
+    assert backend.upload_calls == 1
+    assert clock.value == 120
+    assert (folder / 'snapshot.json').exists()
+
+
 def test_retry_processing_visibility_and_size_limit(tmp_path):
     config = configuration(tmp_path)
     store, backend, clock = storage(config, tmp_path)

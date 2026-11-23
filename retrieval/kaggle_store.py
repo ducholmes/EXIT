@@ -62,6 +62,27 @@ class KaggleBackend:
         with self.api.build_kaggle_client() as client:
             return client.datasets.dataset_api_client.get_dataset(request)
 
+    def _listed_info(self, ref, row):
+        """GetDataset may lag behind ListDatasets/CreateDataset; use status alone.
+
+        A listed Dataset is not proof of a usable upload: publish still requires
+        ready status, a version number, and exact-version manifest read-back.
+        """
+        private = getattr(row, 'is_private', None)
+        if not isinstance(private, bool):
+            raise PermissionError(f'Kaggle lists {ref} but denies reading its visibility metadata')
+        version = int(getattr(row, 'current_version_number', 0) or 0)
+        try:
+            status = self.api.dataset_status(ref)
+        except Exception as exc:
+            if http_status(exc) not in (403, 404):
+                raise
+            return {'private': private, 'version': version, 'versions': [], 'status': 'metadata_pending',
+                    'metadata_error': f'Dataset status temporarily unavailable (HTTP {http_status(exc)})'}
+        if str(status).lower() in ('ready', 'complete', 'completed') and version <= 0:
+            status = 'metadata_pending'
+        return {'private': private, 'version': version, 'versions': [], 'status': status}
+
     def info(self, ref):
         try:
             result = self._get_dataset(ref)
@@ -79,8 +100,9 @@ class KaggleBackend:
                         rows = self.api.dataset_list(mine=True, page=page)
                         if rows is None:
                             raise PermissionError('Kaggle did not return an authenticated Dataset listing')
-                        if any(row and row.ref == ref for row in rows):
-                            raise PermissionError(f'Kaggle lists {ref} but denies reading it; check token permissions')
+                        match = next((row for row in rows if row and row.ref == ref), None)
+                        if match is not None:
+                            return self._listed_info(ref, match)
                         if not rows:
                             print(f'{ref} is absent from your Dataset listing; will create it.', flush=True)
                             return None
@@ -230,9 +252,26 @@ class DatasetStore:
         started = self.clock()
         timeout = (timeout_minutes if timeout_minutes is not None else self.config.get('upload_timeout_minutes', 90)) * 60
         last_error = None
+        metadata_wait_started = None
+
+        def read_info():
+            nonlocal metadata_wait_started
+            info = self.backend.info(ref)
+            if info and info['status'] == 'metadata_pending':
+                if metadata_wait_started is None:
+                    metadata_wait_started = self.clock()
+                    print(f'Waiting for Dataset metadata to become readable: {ref}', flush=True)
+                if self.clock() - metadata_wait_started >= min(timeout, 120):
+                    raise PermissionError(f'{ref} is listed but its status/version metadata remains unavailable '
+                                          'after the propagation wait. Check Dataset visibility and token read permissions; '
+                                          f'local snapshot retained at {folder}')
+            else:
+                metadata_wait_started = None
+            return info
+
         for attempt in range(3):
             try:
-                info = self.backend.info(ref)
+                info = read_info()
                 if info and info['private']:
                     raise ValueError(f'{ref} is private; expected public. Choose a new public Dataset.')
                 version = self._matching_version(ref, info, manifest['snapshot_id']) if info and self._ready(info['status']) else None
@@ -244,14 +283,14 @@ class DatasetStore:
                         if self.clock() - started >= timeout:
                             raise TimeoutError('Kaggle Dataset processing timed out')
                         self.sleep(15)
-                        info = self.backend.info(ref)
+                        info = read_info()
                     version = self._matching_version(ref, info, manifest['snapshot_id']) if info else None
                     if version is None:
                         label = 'API CHECK' if manifest['kind'] == 'api-check' else 'ARTIFACT UPLOAD' if manifest['kind'] == 'artifact' else 'CHECKPOINT UPLOAD'
                         print(f'{label}: {manifest["kind"]}, {total / 1024**3:.2f} GiB to {ref}', flush=True)
                         self.backend.upload(ref, folder, bool(info), manifest['snapshot_id'])
                 while True:
-                    info = self.backend.info(ref)
+                    info = read_info()
                     if info and self._failed(info['status']):
                         raise RuntimeError('Kaggle Dataset processing failed')
                     if info and self._ready(info['status']):
