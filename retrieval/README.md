@@ -1,5 +1,12 @@
 # Wikipedia retrieval on Kaggle
 
+For a small real-data validation before the full corpus, use
+[kaggle_retrieval_smoke_test.ipynb](../notebooks/kaggle_retrieval_smoke_test.ipynb).
+It selects 10,000 ID-matched passages/vectors from existing sources, checks SQLite,
+sampling and index resume, compares PQ with Flat, and optionally tests real public
+Dataset upload/restore and EXIT/reader. Set `RUN_KAGGLE` and `RUN_EXIT` explicitly;
+disabled sections are reported as SKIP. It uses separate scratch and Dataset names.
+
 Run from the repository root. Install `requirements-retrieval.txt`; Kaggle supplies PyTorch. EXIT additionally needs the main requirements and spaCy setup. No data downloads happen at import time.
 
 Starter notebooks: [preparation](../notebooks/kaggle_retrieval_prepare.ipynb) and [inference](../notebooks/kaggle_retrieval_inference.ipynb). Adjust the checkout and attached Dataset paths before running. The preparation notebook now uses a config-driven status/restore/resume workflow with direct public Dataset uploads.
