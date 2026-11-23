@@ -12,6 +12,7 @@ import urllib.request
 from pathlib import Path
 
 from .storage import Corpus, digest, prepare_corpus, write_json
+from .progress import activity, copy_stream
 
 SOURCES = {
     'corpus': 'https://dl.fbaipublicfiles.com/dpr/wikipedia_split/psgs_w100.tsv.gz',
@@ -22,16 +23,18 @@ SOURCES = {
 def download(url, target, deadline, on_progress=None):
     target = Path(target)
     if target.exists():
+        print(f'Download already exists: {target}', flush=True)
         return
     target.parent.mkdir(parents=True, exist_ok=True)
     part = target.with_name(target.name + '.part')
     meta = part.with_name(part.name + '.json')
     old = json.loads(meta.read_text()) if meta.exists() else {}
     size = part.stat().st_size if part.exists() else 0
+    print(f'Download: {target.name}; local partial {size / 1024**3:.2f} GiB', flush=True)
     headers = {}
     if size and old.get('url') == url and old.get('validator'):
         headers = {'Range': f'bytes={size}-', 'If-Range': old['validator']}
-    with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=120) as response:
+    with activity(f'Downloading {target.name}'), urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=120) as response:
         append = response.status == 206 and response.headers.get('Content-Range', '').startswith(f'bytes {size}-')
         write_json(meta, {'url': url, 'validator': response.headers.get('ETag') or response.headers.get('Last-Modified')})
         expected = response.headers.get('Content-Length')
@@ -62,7 +65,7 @@ def extract(source, output, on_progress=None):
         if not target.exists():
             temporary = target.with_name(target.name + '.tmp')
             with gzip.open(source, 'rb') as src, temporary.open('wb') as dst:
-                shutil.copyfileobj(src, dst, 8 * 1024 * 1024)
+                copy_stream(src, dst, f'Extracting {target.name}')
             os.replace(temporary, target)
             if on_progress:
                 on_progress({'file': target.name})
@@ -80,7 +83,7 @@ def extract(source, output, on_progress=None):
                 target.parent.mkdir(parents=True, exist_ok=True)
                 temporary = target.with_name(target.name + '.tmp')
                 with archive.extractfile(member) as src, temporary.open('wb') as dst:
-                    shutil.copyfileobj(src, dst, 8 * 1024 * 1024)
+                    copy_stream(src, dst, f'Extracting {member.name}')
                 os.replace(temporary, target)
                 if on_progress:
                     on_progress({'file': member.name})
@@ -89,7 +92,7 @@ def extract(source, output, on_progress=None):
 def load_shard(path, dimension):
     import numpy as np
     # Only load the trusted official archive: its shards use Python pickle.
-    with open(path, 'rb') as source:
+    with activity(f'Loading embedding shard {Path(path).name}'), open(path, 'rb') as source:
         ids, vectors = pickle.load(source)
     vectors = np.asarray(vectors)
     if vectors.ndim != 2 or vectors.shape != (len(ids), dimension) or not np.isfinite(vectors).all():
@@ -176,8 +179,10 @@ def train(args):
         raise ValueError('Invalid PQ dimensions or too few training vectors')
     index = Indexer(args.dimension, args.pq_m, args.bits)
     index.index.pq.cp.seed = args.seed
-    index.index.train(state['sample'][:min(state['seen'], state['size'])])
-    index.serialize(str(target))
+    with activity(f'Training PQ on {min(state["seen"], state["size"]):,} sample vectors'):
+        index.index.train(state['sample'][:min(state['seen'], state['size'])])
+    with activity('Writing trained PQ index'):
+        index.serialize(str(target))
     write_json(target / 'complete.json', config)
 
 
@@ -194,7 +199,8 @@ def checkpoint(index, work, state):
     parent.mkdir(exist_ok=True)
     target = parent / f"generation-{time.time_ns():020d}"
     target.mkdir()
-    index.serialize(str(target))
+    with activity('Writing FAISS checkpoint'):
+        index.serialize(str(target))
     write_json(target / 'complete.json', state)
     # Keep the newest two valid generations.
     generations = sorted(p for p in parent.glob('generation-*') if (p / 'complete.json').exists())
@@ -252,8 +258,10 @@ def build(args, deadline):
         args.output.mkdir(parents=True, exist_ok=True)
         if (args.output / 'manifest.json').exists():
             raise ValueError('Output artifact already exists; select a new output directory')
-        index.serialize(str(args.output))
-        shutil.copyfile(args.corpus, args.output / 'corpus.sqlite')
+        with activity('Writing final FAISS index'):
+            index.serialize(str(args.output))
+        with activity('Copying SQLite corpus into final artifact'):
+            shutil.copyfile(args.corpus, args.output / 'corpus.sqlite')
         versions = {p: importlib.metadata.version(p) for p in ('numpy', 'faiss-cpu', 'transformers')}
         result = {'complete': True, 'dimension': args.dimension, 'vectors': index.index.ntotal,
                   'passages': corpus_state['count'], 'model': 'facebook/contriever-msmarco',

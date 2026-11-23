@@ -16,6 +16,7 @@ from types import SimpleNamespace
 from . import prepare
 from .kaggle_store import DatasetStore, http_status, make_snapshot, restore_snapshot, utc_now
 from .storage import digest, prepare_corpus, write_json
+from .progress import activity
 
 DEFAULTS = {'root': '/tmp/retrieval-state', 'downloads': '/tmp/retrieval-downloads',
             'sources': '/tmp/retrieval-sources', 'dimension': 768, 'pq_m': 96,
@@ -206,6 +207,7 @@ class Workflow:
         self.store = store or DatasetStore(config)
         self._api_checked = False
         self._digest_cache = {}
+        self._last_progress_log = None
         self.started = self.last_checkpoint = clock()
         self.registry = read_json(self.root / 'pipeline.json', {'config_id': config['config_id'], 'completed': []})
         if self.registry['config_id'] != config['config_id']:
@@ -225,6 +227,11 @@ class Workflow:
     def tick(self, save=lambda: None, progress=None):
         self.registry['progress'] = progress
         self.save_registry()
+        now = self.clock()
+        if self._last_progress_log is None or now - self._last_progress_log >= 30:
+            print(f'PROGRESS [{self.registry.get("current") or "processing"}]: '
+                  + json.dumps(progress or {}, ensure_ascii=False), flush=True)
+            self._last_progress_log = now
         if self.clock() - self.last_checkpoint >= self.config['checkpoint_minutes'] * 60:
             current = self.registry.get('current') or ''
             if current.startswith(('download-', 'extract-')):
@@ -256,7 +263,8 @@ class Workflow:
         if self._api_checked:
             return read_json(self.root / 'api-check.json')
         try:
-            result = self.store.check_api()
+            with activity('Kaggle API upload/read-back check'):
+                result = self.store.check_api()
         except Exception as exc:
             write_json(self.root / 'api-check.json', {'status': 'failed', 'checked_at': utc_now(),
                        'error_type': type(exc).__name__, 'http_status': http_status(exc),
@@ -344,6 +352,7 @@ class Workflow:
         shutil.rmtree(folder)
 
     def run(self):
+        print(f'RESUME: work root={self.root}; checking Kaggle API before processing', flush=True)
         self.check_api()
         import faiss
         faiss.omp_set_num_threads(self.config['threads'])

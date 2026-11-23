@@ -157,3 +157,7 @@ Run `python -m pytest tests/test_retrieval_new.py tests/test_retrieval_workflow.
 HTTP 401/403 are reported with the Dataset/operation when available and are not retried blindly. Check that the Secret is enabled, the token permits Dataset read/write, and config `owner` is the correct account. An explicit personal `KAGGLE_API_TOKEN` takes priority over the default notebook token. A 403 while probing a new slug is not assumed to mean absence: the uploader checks the authenticated Dataset listing before creating it. Never print your token to debug.
 
 A failed download-only upload from older code is not retried at resume startup. After the API check passes, only meaningful changed SQLite/sample/PQ/index state is saved. Existing `.part` files and legacy checkpoints are preserved.
+
+### Progress logs
+
+For live notebook output use `python -u -m retrieval.prepare resume --config ...`. The notebook uses the same interpreter with `-u` and `subprocess.run(..., check=True)`. `RESUME` and API-check messages appear before heavy processing. `START`/`DONE` mark hashing, extraction, shard loading, checkpoint writing and PQ training; `WORKING` heartbeats show elapsed time every 30 seconds for blocking operations. `PROGRESS` shows real batch counters about every 30 seconds, while `DATASET STATUS` shows remote processing status. Heartbeats report a running operation, not proof of forward progress or an invented percentage. Do not launch a second resume writer against the same root while the first is running.

@@ -5,13 +5,17 @@ import json
 import os
 import sqlite3
 from pathlib import Path
+from .progress import activity
 
 
 def digest(path):
     h = hashlib.sha256()
-    with open(path, 'rb') as f:
+    total = Path(path).stat().st_size
+    read = 0
+    with activity(f'Hashing {Path(path).name}', lambda: f'{read / 1024**3:.2f}/{total / 1024**3:.2f} GiB'), open(path, 'rb') as f:
         for block in iter(lambda: f.read(8 * 1024 * 1024), b''):
             h.update(block)
+            read += len(block)
     return h.hexdigest()
 
 

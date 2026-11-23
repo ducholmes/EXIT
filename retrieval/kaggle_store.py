@@ -253,10 +253,15 @@ class DatasetStore:
         timeout = (timeout_minutes if timeout_minutes is not None else self.config.get('upload_timeout_minutes', 90)) * 60
         last_error = None
         metadata_wait_started = None
+        last_status_log = None
 
         def read_info():
-            nonlocal metadata_wait_started
+            nonlocal metadata_wait_started, last_status_log
             info = self.backend.info(ref)
+            if last_status_log is None or self.clock() - last_status_log >= 30:
+                print(f'DATASET STATUS: {ref}; state={info["status"] if info else "not visible"}; '
+                      f'version={info["version"] if info else "unknown"}; elapsed={self.clock() - started:.0f}s', flush=True)
+                last_status_log = self.clock()
             if info and info['status'] == 'metadata_pending':
                 if metadata_wait_started is None:
                     metadata_wait_started = self.clock()
