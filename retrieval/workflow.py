@@ -24,15 +24,15 @@ DEFAULTS = {'root': '/tmp/retrieval-state', 'downloads': '/tmp/retrieval-downloa
             'threads': 4, 'checkpoint_minutes': 120, 'time_budget_minutes': 600,
             'upload_timeout_minutes': 90, 'api_check_timeout_minutes': 10, 'license': 'other'}
 SETTINGS = ('dimension', 'pq_m', 'bits', 'sample_size', 'seed')
-STEPS = ('download-corpus', 'extract-corpus', 'download-embeddings', 'extract-embeddings',
+STEPS = ('download-corpus', 'extract-corpus', 'download-embeddings', 'extract-embeddings', 'publish-embeddings',
          'prepare-corpus', 'sample-pq', 'train-pq', 'build-index', 'verify', 'publish-artifact')
-SAVE_AFTER = {'prepare-corpus', 'sample-pq', 'train-pq', 'build-index', 'publish-artifact'}
+SAVE_AFTER = {'publish-embeddings', 'prepare-corpus', 'sample-pq', 'train-pq', 'build-index', 'publish-artifact'}
 
 
 def load_config(path):
     raw = json.loads(Path(path).read_text(encoding='utf-8'))
     allowed = set(DEFAULTS) | {'owner', 'dataset_prefix', 'tsv', 'shards', 'checkpoint_input', 'corpus_input',
-                               'max_dataset_bytes', 'public'}
+                               'max_dataset_bytes', 'public', 'embeddings_dataset', 'embeddings_input'}
     unknown = set(raw) - allowed
     if unknown:
         raise ValueError('Unknown config keys (credentials belong in environment/Secrets): ' + ', '.join(sorted(unknown)))
@@ -54,6 +54,8 @@ def load_config(path):
         config[name] = str(Path(config[name]).resolve())
     config.setdefault('tsv', str(Path(config['sources']) / 'psgs_w100.tsv'))
     config.setdefault('shards', str(Path(config['sources']) / 'wikipedia_embeddings' / 'passages_*'))
+    if config.get('embeddings_dataset') and not re.fullmatch(r'[A-Za-z0-9_-]+/[a-z0-9][a-z0-9-]{5,49}', config['embeddings_dataset']):
+        raise ValueError('embeddings_dataset must be owner/dataset-slug')
     config['auto_shards'] = 'shards' not in raw
     config['config_id'] = hashlib.sha256(json.dumps({k: config[k] for k in SETTINGS}, sort_keys=True).encode()).hexdigest()
     return config
@@ -64,6 +66,14 @@ def read_json(path, default=None):
 
 
 def shard_pattern(config):
+    if config.get('embeddings_input'):
+        folder = Path(config['embeddings_input'])
+        manifest = read_json(folder / 'embeddings-manifest.json')
+        names = [row['name'] for row in manifest.get('shards', [])]
+        for prefix in ('passages_', 'wiki_'):
+            if names and all(name.startswith(prefix) for name in names):
+                return str(folder / (prefix + '*'))
+        return str(folder / '*')
     if glob.glob(config['shards']) or not config.get('auto_shards'):
         return config['shards']
     candidates = []
@@ -156,8 +166,14 @@ def inspect(config):
         completed.discard('extract-corpus')
     completed.discard('extract-embeddings')
     if (glob.glob(shards) and read_json(root / 'extraction.json').get('embeddings')) or (
-            '/kaggle/input/' in shards.replace('\\', '/') and glob.glob(shards)):
+            '/kaggle/input/' in shards.replace('\\', '/') and glob.glob(shards)) or (
+            glob.glob(shards) and (config.get('embeddings_input') or not config.get('auto_shards'))):
         completed.add('extract-embeddings')
+    remote = read_json(root / 'remote.json')
+    if remote.get('embeddings'):
+        completed.add('publish-embeddings')
+    else:
+        completed.discard('publish-embeddings')
     # A restored corpus/sample eliminates unnecessary source work for those stages.
     required = []
     need_shards = not artifact.get('complete')
@@ -168,7 +184,7 @@ def inspect(config):
     if need_shards:
         if not glob.glob(shards) or 'extract-embeddings' not in completed:
             required.extend(['download-embeddings', 'extract-embeddings'])
-        required.extend(['sample-pq', 'train-pq', 'build-index'])
+        required.extend(['publish-embeddings', 'sample-pq', 'train-pq', 'build-index'])
     required.extend(['verify', 'publish-artifact'])
     # Completed source markers cannot override a missing source in a fresh session.
     for kind in ('corpus', 'embeddings'):
@@ -188,6 +204,10 @@ def inspect(config):
     if indexed and 'build-index' not in completed:
         statuses['build-index'] = 'in_progress'
     return {'steps': statuses, 'next_step': pending[0] if pending else None,
+            'embedding_source': read_json(root / 'embedding-source.json', {
+                'dataset': config.get('embeddings_dataset') or f'{config["owner"]}/{config["dataset_prefix"]}-embeddings',
+                'input': config.get('embeddings_input'), 'location': 'input' if config.get('embeddings_input') else 'local',
+                'reference': remote.get('embeddings')}),
             'corpus': corpus, 'sampling': sampled, 'index': {k: v for k, v in indexed.items() if k != 'identity'},
             'local_checkpoint': str(generation) if generation else None, 'remote': remote,
             'last_progress': registry.get('progress'), 'last_error': registry.get('error'),
@@ -207,6 +227,8 @@ class Workflow:
         self.store = store or DatasetStore(config)
         self._api_checked = False
         self._digest_cache = {}
+        self._embedding_files = None
+        self._source_checked = False
         self._last_progress_log = None
         self.started = self.last_checkpoint = clock()
         self.registry = read_json(self.root / 'pipeline.json', {'config_id': config['config_id'], 'completed': []})
@@ -245,12 +267,50 @@ class Workflow:
 
     def args(self):
         return SimpleNamespace(**{**self.config, 'work': self.work, 'corpus': self.root / 'corpus.sqlite',
-                                  'output': self.root / 'artifact', 'shards': shard_pattern(self.config), 'control': self})
+                                  'output': self.root / 'artifact', 'shards': shard_pattern(self.config),
+                                  'embedding_files': self._embedding_files, 'control': self})
+
+    def source_manager(self):
+        from .embedding_source import EmbeddingSource
+        return EmbeddingSource(self.config, self.store)
+
+    def publish_embeddings(self):
+        manager = self.source_manager()
+        remote = read_json(self.root / 'remote.json')
+        expected = remote.get('embeddings')
+        if expected and expected['dataset'] != self.store.ref('embeddings'):
+            raise ValueError('Configured embedding Dataset differs from restored checkpoint source')
+        directory = self.config.get('embeddings_input')
+        if directory:
+            manifest, paths = manager.attached(directory, expected)
+        else:
+            paths = [Path(p) for p in sorted(glob.glob(shard_pattern(self.config))) if Path(p).is_file()]
+            if paths and (paths[0].parent / 'embeddings-manifest.json').exists():
+                directory = str(paths[0].parent)
+                manifest, paths = manager.attached(directory, expected)
+            else:
+                manifest, paths = manager.local(paths, expected)
+        corpus = corpus_progress(self.root)
+        expected_count = corpus['count'] if corpus.get('complete') else (21015324 if self.config['dimension'] == 768 else None)
+        if expected_count is not None and expected_count != manifest['vectors']:
+            raise ValueError('Embedding vector total differs from completed corpus passage count')
+        receipt = manager.publish(manifest, paths)
+        remote['embeddings'] = receipt
+        write_json(self.root / 'remote.json', remote)
+        write_json(self.root / 'embedding-source.json', {'reference': receipt, 'source_id': manifest['source_id'],
+            'shards': len(paths), 'vectors': manifest['vectors'], 'location': 'input' if directory else 'local', 'input': directory})
+        extraction = read_json(self.root / 'extraction.json')
+        extraction['embeddings'] = True
+        write_json(self.root / 'extraction.json', extraction)
+        self._embedding_files = paths
+        self._source_checked = True
+        return receipt
 
     def _progress(self, payload_id=None):
         return {'config_id': self.config['config_id'], 'completed': self.registry['completed'],
                 'current': self.registry.get('current'), 'progress': self.registry.get('progress'),
-                'artifact_ref': read_json(self.root / 'remote.json').get('artifact'), 'payload_id': payload_id}
+                'artifact_ref': read_json(self.root / 'remote.json').get('artifact'),
+                'embeddings_ref': read_json(self.root / 'remote.json').get('embeddings'), 'payload_id': payload_id}
 
     def _skip_checkpoint(self, reason):
         print('CHECKPOINT SKIP: ' + reason, flush=True)
@@ -314,9 +374,11 @@ class Workflow:
             return self._skip_checkpoint('no processed data; only download/extraction or empty pipeline state')
         corpus_identity = hashlib.sha256(json.dumps(corpus, sort_keys=True).encode()).hexdigest() if has_corpus else None
         artifact_ref = remote.get('artifact', {})
+        embedding_ref = remote.get('embeddings', {})
         payload = {'corpus_identity': corpus_identity,
                    'files': {name: self._file_digest(value[0]) for name, value in files.items()},
-                   'artifact': {k: artifact_ref.get(k) for k in ('dataset', 'version', 'snapshot_id')}}
+                   'artifact': {k: artifact_ref.get(k) for k in ('dataset', 'version', 'snapshot_id')},
+                   'embeddings': {k: embedding_ref.get(k) for k in ('dataset', 'version', 'snapshot_id', 'source_id')}}
         payload_id = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
         if remote.get('checkpoint_payload_id') == payload_id:
             return self._skip_checkpoint('processed data and resume position have not changed')
@@ -362,6 +424,8 @@ class Workflow:
             self.registry.pop('error', None)
             self.save_registry()
         while True:
+            if self.config.get('embeddings_input') and not self._source_checked and not (self.root / 'artifact/manifest.json').exists():
+                self.publish_embeddings()
             report = inspect(self.config)
             step = report['next_step']
             if step is None:
@@ -377,11 +441,15 @@ class Workflow:
             try:
                 if step.startswith('download-'):
                     kind = step.removeprefix('download-')
+                    if kind == 'embeddings':
+                        self.source_manager().require_input_if_remote()
                     url = prepare.SOURCES[kind]
                     prepare.download(url, Path(self.config['downloads']) / url.rsplit('/', 1)[1], self.deadline,
                                      lambda p: self.tick(progress=p))
                 elif step.startswith('extract-'):
                     kind = step.removeprefix('extract-')
+                    if kind == 'embeddings':
+                        self.source_manager().require_input_if_remote()
                     archive = Path(self.config['downloads']) / prepare.SOURCES[kind].rsplit('/', 1)[1]
                     prepare.extract(archive, Path(self.config['sources']), lambda p: self.tick(progress=p))
                     if kind == 'embeddings' and not glob.glob(shard_pattern(self.config)):
@@ -389,12 +457,16 @@ class Workflow:
                     extracted = read_json(self.root / 'extraction.json')
                     extracted[kind] = True
                     write_json(self.root / 'extraction.json', extracted)
+                elif step == 'publish-embeddings':
+                    self.publish_embeddings()
                 elif step == 'prepare-corpus':
                     result = prepare_corpus(self.config['tsv'], self.root / 'corpus.sqlite', self.deadline,
                                             on_progress=lambda p: self.tick(progress=p))
                     if not result['complete']:
                         raise BudgetReached()
                 elif step == 'sample-pq':
+                    if not self._source_checked:
+                        self.publish_embeddings()
                     prepare.sample(self.args(), self.deadline)
                     p = sample_progress(self.root)
                     if p['next_shard'] != len(p['shards']):
@@ -403,6 +475,8 @@ class Workflow:
                     # No callback inside FAISS training; save the reusable sample first.
                     prepare.train(self.args())
                 elif step == 'build-index':
+                    if not self._source_checked:
+                        self.publish_embeddings()
                     prepare.build(self.args(), self.deadline)
                     if not (self.root / 'artifact/manifest.json').exists():
                         raise BudgetReached()
@@ -424,7 +498,11 @@ class Workflow:
                 return
             except Exception as exc:
                 self.registry['error'] = type(exc).__name__
-                self.save_registry()
+                try:
+                    self.save_registry()
+                except OSError as state_error:
+                    print(f'Could not save error state at {self.root} '
+                          f'(errno={state_error.errno}); preserving the original failure.', flush=True)
                 print('Stopped; last confirmed Dataset references are in remote.json. Local snapshot retained.', flush=True)
                 raise
 
@@ -490,6 +568,8 @@ def restore(config, store=None, checkpoint_ref=None):
                                                        local_folder=config.get('corpus_input'))
         remote['corpus_identity'] = hashlib.sha256(json.dumps(corpus_manifest['progress'], sort_keys=True).encode()).hexdigest()
     progress = manifest['progress']
+    if progress.get('embeddings_ref'):
+        remote['embeddings'] = progress['embeddings_ref']
     if progress.get('payload_id'):
         remote['checkpoint_payload_id'] = progress['payload_id']
     if progress.get('artifact_ref'):
@@ -504,7 +584,7 @@ def restore(config, store=None, checkpoint_ref=None):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('step', choices=['check-api', 'status', 'resume', 'checkpoint', 'restore'])
+    parser.add_argument('step', choices=['check-api', 'status', 'resume', 'checkpoint', 'restore', 'publish-embeddings'])
     parser.add_argument('--config', type=Path, required=True)
     parser.add_argument('--json', action='store_true', help='Machine-readable status')
     args = parser.parse_args()
@@ -523,6 +603,7 @@ def main():
             print('Sampling progress:', {k: result['sampling'].get(k) for k in ('next_shard', 'offset', 'seen')})
             print('Last confirmed remote saves:', json.dumps(result['remote'], indent=2))
             print('Last API check:', json.dumps(result['api_check'], indent=2))
+            print('Embedding source:', json.dumps(result['embedding_source'], indent=2))
             print('Next checkpoint due (active run):', result['next_checkpoint_at'])
             print(result['limitations'])
     elif args.step == 'restore':
@@ -531,6 +612,10 @@ def main():
         Workflow(config).publish_checkpoint()
     elif args.step == 'check-api':
         Workflow(config).check_api()
+    elif args.step == 'publish-embeddings':
+        flow = Workflow(config)
+        flow.check_api()
+        flow.publish_embeddings()
     else:
         Workflow(config).run()
 

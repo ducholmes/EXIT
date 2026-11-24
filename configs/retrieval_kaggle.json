@@ -5,6 +5,8 @@
   "root": "/tmp/retrieval-state",
   "downloads": "/tmp/retrieval-downloads",
   "sources": "/tmp/retrieval-sources",
+  "embeddings_dataset": null,
+  "embeddings_input": null,
   "dimension": 768,
   "pq_m": 96,
   "bits": 8,

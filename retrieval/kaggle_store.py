@@ -165,6 +165,8 @@ class DatasetStore:
         return self._backend
 
     def ref(self, kind):
+        if kind == 'embeddings' and self.config.get('embeddings_dataset'):
+            return self.config['embeddings_dataset']
         return f"{self.config['owner']}/{self.config['dataset_prefix']}-{kind}"
 
     def check_api(self):
@@ -213,7 +215,7 @@ class DatasetStore:
             path = self.backend.fetch(ref, version, 'snapshot.json', Path(folder))
             return json.loads(path.read_text(encoding='utf-8'))
 
-    def _matching_version(self, ref, info, snapshot_id):
+    def _matching_version(self, ref, info, snapshot_id, expected_config_id=None, source_id=None):
         if not info:
             return None
         # Version notes let us find an upload accepted before a connection failure.
@@ -228,13 +230,18 @@ class DatasetStore:
                 raise
             if remote.get('snapshot_id') == snapshot_id:
                 return version
-            if remote.get('config_id') != self.config['config_id']:
+            if remote.get('config_id') != (expected_config_id or self.config['config_id']):
                 raise ValueError(f'{ref} belongs to a different retrieval configuration; choose another prefix')
+            if source_id is not None and remote.get('progress', {}).get('source_id') != source_id:
+                raise ValueError(f'{ref} contains a different embedding source; choose another embeddings_dataset')
         return None
 
     def publish(self, folder, timeout_minutes=None):
         """Never mark durable before the exact snapshot is downloadable and ready."""
         manifest = json.loads((folder / 'snapshot.json').read_text(encoding='utf-8'))
+        def matching(info):
+            return self._matching_version(ref, info, manifest['snapshot_id'], manifest['config_id'],
+                manifest['progress']['source_id'] if manifest['kind'] == 'embeddings' else None)
         ref = self.ref(manifest['kind'])
         total = sum(x['bytes'] for x in manifest['files'].values())
         if total >= self.config.get('max_dataset_bytes', 200_000_000_000):
@@ -279,7 +286,7 @@ class DatasetStore:
                 info = read_info()
                 if info and info['private']:
                     raise ValueError(f'{ref} is private; expected public. Choose a new public Dataset.')
-                version = self._matching_version(ref, info, manifest['snapshot_id']) if info and self._ready(info['status']) else None
+                version = matching(info) if info and self._ready(info['status']) else None
                 if version is None:
                     # Do not submit another version while an earlier upload is processing.
                     while info and not self._ready(info['status']):
@@ -289,9 +296,9 @@ class DatasetStore:
                             raise TimeoutError('Kaggle Dataset processing timed out')
                         self.sleep(15)
                         info = read_info()
-                    version = self._matching_version(ref, info, manifest['snapshot_id']) if info else None
+                    version = matching(info) if info else None
                     if version is None:
-                        label = 'API CHECK' if manifest['kind'] == 'api-check' else 'ARTIFACT UPLOAD' if manifest['kind'] == 'artifact' else 'CHECKPOINT UPLOAD'
+                        label = {'api-check': 'API CHECK', 'artifact': 'ARTIFACT UPLOAD', 'embeddings': 'EMBEDDING SOURCE UPLOAD'}.get(manifest['kind'], 'CHECKPOINT UPLOAD')
                         print(f'{label}: {manifest["kind"]}, {total / 1024**3:.2f} GiB to {ref}', flush=True)
                         self.backend.upload(ref, folder, bool(info), manifest['snapshot_id'])
                 while True:
@@ -299,7 +306,7 @@ class DatasetStore:
                     if info and self._failed(info['status']):
                         raise RuntimeError('Kaggle Dataset processing failed')
                     if info and self._ready(info['status']):
-                        version = self._matching_version(ref, info, manifest['snapshot_id'])
+                        version = matching(info)
                         if version is not None:
                             receipt = {'dataset': ref, 'version': version, 'snapshot_id': manifest['snapshot_id'],
                                        'confirmed_at': utc_now(), 'url': f'https://www.kaggle.com/datasets/{ref}/versions/{version}'}

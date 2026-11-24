@@ -100,8 +100,8 @@ def load_shard(path, dimension):
     return [str(x) for x in ids], vectors
 
 
-def shard_manifest(pattern):
-    files = sorted(Path(p) for p in glob.glob(pattern))
+def shard_manifest(pattern, paths=None):
+    files = sorted(Path(p) for p in (paths if paths is not None else glob.glob(pattern)))
     if not files:
         raise ValueError('No embedding shards matched')
     return [{'name': p.name, 'size': p.stat().st_size, 'sha256': digest(p)} for p in files], files
@@ -117,7 +117,7 @@ def save_sample(path, state):
 
 def sample(args, deadline):
     import numpy as np
-    manifest, paths = shard_manifest(args.shards)
+    manifest, paths = shard_manifest(args.shards, getattr(args, 'embedding_files', None))
     state_path = args.work / 'sample.pkl'
     state = pickle.loads(state_path.read_bytes()) if state_path.exists() else {
         'shards': manifest, 'next_shard': 0, 'seen': 0, 'size': args.sample_size,
@@ -213,7 +213,7 @@ def build(args, deadline):
     import importlib.metadata
     from huggingface_hub import model_info
     from utils.src.index import Indexer
-    manifest, paths = shard_manifest(args.shards)
+    manifest, paths = shard_manifest(args.shards, getattr(args, 'embedding_files', None))
     trained = args.work / 'trained'
     training = json.loads((trained / 'complete.json').read_text())
     if training['dimension'] != args.dimension:
@@ -300,11 +300,11 @@ def verify(path):
 
 def main():
     import sys
-    if len(sys.argv) > 1 and sys.argv[1] in ('check-api', 'status', 'resume', 'checkpoint', 'restore'):
+    if len(sys.argv) > 1 and sys.argv[1] in ('check-api', 'status', 'resume', 'checkpoint', 'restore', 'publish-embeddings'):
         from .workflow import main as workflow_main
         return workflow_main()
     parser = argparse.ArgumentParser(description=__doc__,
-        epilog='Automatic workflow: check-api / status / resume / checkpoint / restore --config CONFIG.json')
+        epilog='Automatic workflow: check-api / status / resume / checkpoint / restore / publish-embeddings --config CONFIG.json')
     parser.add_argument('step', choices=['preflight', 'download', 'extract', 'prepare-corpus', 'sample-pq', 'train-pq', 'build-index', 'verify'])
     parser.add_argument('--work', type=Path, default=Path('data/retrieval/work'))
     parser.add_argument('--output', type=Path, default=Path('data/retrieval/artifact'))

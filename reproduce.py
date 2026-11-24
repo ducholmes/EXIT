@@ -424,9 +424,6 @@ def main() -> None:
         reading_times = [run["reading_time"] for run in runs]
         total_times = [run["total_time"] for run in runs]
         em, f1 = score_answer(result["answer"], answers)
-        if em is not None:
-            exact_matches.append(em)
-            f1_scores.append(f1)
 
         record = {
             "index": index,

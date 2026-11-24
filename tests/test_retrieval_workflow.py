@@ -566,3 +566,25 @@ def test_registry_changes_do_not_create_checkpoint_version(tmp_path):
     prepare.save_sample(flow.work / 'sample.pkl', state)
     assert flow.publish_checkpoint()
     assert backend.upload_calls == calls + 1
+
+
+def test_readonly_error_reporting_preserves_original_failure(tmp_path, monkeypatch):
+    from retrieval import workflow
+    config = configuration(tmp_path)
+    flow = Workflow(config, store=object())
+    monkeypatch.setattr(flow, 'check_api', lambda: None)
+    flow._source_checked = True
+    monkeypatch.setattr(workflow, 'inspect', lambda _: {'next_step': 'build-index'})
+    calls = []
+    def save_registry():
+        calls.append(True)
+        if len(calls) > 1:
+            raise OSError(30, 'Read-only filesystem while reporting error')
+    monkeypatch.setattr(flow, 'save_registry', save_registry)
+    original = OSError(30, 'Read-only filesystem while writing index')
+    def fail_build(*args):
+        raise original
+    monkeypatch.setattr(prepare, 'build', fail_build)
+    with pytest.raises(OSError) as caught:
+        flow.run()
+    assert caught.value is original

@@ -13,7 +13,7 @@ Starter notebooks: [preparation](../notebooks/kaggle_retrieval_prepare.ipynb) an
 
 ## Automatic Kaggle Dataset workflow (recommended)
 
-Edit `configs/retrieval_kaggle.json`: set `owner` to your Kaggle username and choose `dataset_prefix`. All four Datasets (including the API probe) are **public**. The default license metadata is `other`; the published description identifies the DPR/Contriever sources and Wikipedia terms. Set a more specific compatible license if appropriate for your redistribution.
+Edit `configs/retrieval_kaggle.json`: set `owner` to your Kaggle username and choose `dataset_prefix`. All five Datasets (including the API probe and embedding source) are **public**. The default license metadata is `other`; the published description identifies the DPR/Contriever sources and Wikipedia terms. Set a more specific compatible license if appropriate for your redistribution.
 
 Authenticate in a Kaggle notebook using Secrets (never put credentials in the config):
 
@@ -41,15 +41,40 @@ python -m retrieval.prepare resume --config configs/retrieval_kaggle.json
 
 Every new `resume` process automatically performs this read/write check before download or processing, even if you ran the separate notebook check cell. A successful check is reused within the same process only. Failure stops before heavy work. A small successful probe cannot guarantee quota or throughput for large uploads. Notebook check/resume cells use `subprocess.run(..., check=True)` so failures raise visible cell errors.
 
-`resume` runs only unfinished steps in dependency order. It downloads missing sources, extracts files, imports SQLite, samples/trains PQ, builds/verifies the index and publishes the artifact. The official `passages_*` and `wiki_*` shard prefixes are auto-detected. Set `tsv`/`shards` explicitly for attached sources or unusual layouts. Raw inputs are excluded from snapshots: if scratch sources disappear across sessions, they are downloaded/extracted again. This means download progress is local-only across sessions unless you separately preserve the `.part` files.
+`resume` runs only unfinished steps in dependency order. It downloads missing sources, extracts files, imports SQLite, publishes the immutable embedding source once, samples/trains PQ, builds/verifies the index and publishes the artifact. The official `passages_*` and `wiki_*` shard prefixes are auto-detected. Set `tsv`/`shards` explicitly for attached sources or unusual layouts. Raw inputs are excluded from periodic checkpoints. Once the embedding Dataset exists, a missing local source stops with Add Input instructions instead of downloading the Facebook archive again. Incomplete downloads remain local-only unless separately preserved.
+
+### Reuse the embedding Dataset
+
+The first full preparation run publishes `<owner>/<dataset_prefix>-embeddings` immediately after extraction. It contains original shard files, `embeddings-manifest.json` and `snapshot.json`. Original IDs, filenames and vectors are not changed. Source identity is independent of PQ/sample settings. The corpus must match the total vector count; publishing a partial set of shards is rejected when the completed corpus or prior sample/checkpoint establishes the expected source.
+
+For already downloaded/extracted data in the current session:
+
+```bash
+python -u -m retrieval.prepare publish-embeddings --config /kaggle/working/retrieval-session.json
+```
+
+This validates one shard at a time (shape, counts, finite values, dtype and SHA-256), then stages immutable copies in scratch before direct upload. Ensure free scratch can hold a second copy of the shards. Matching source already on Kaggle is reused without a new version; different content requires a different `embeddings_dataset`. Hash/shape validation is cached against local file sizes and mtimes. Changed files invalidate that cache.
+
+Next session: use **Add Input** to attach the embedding Dataset and set the mount path in your notebook config before writing the JSON:
+
+```python
+config['embeddings_input'] = '/kaggle/input/exit-wikipedia-retrieval-embeddings'
+# Optional: use a different existing source Dataset, independent of output prefix:
+# config['embeddings_dataset'] = 'owner/another-embedding-dataset'
+```
+
+The directory must contain `embeddings-manifest.json` plus its shard files. Mount paths can vary; use the path shown in Kaggle's Input browser. Then restore/status/resume as usual. Input hashes and pinned snapshot identity are checked before sampling/indexing; shards are read directly from Input and not copied into the writable state folder. Source manifest/hash validation happens once per run, although the existing index builder may also hash inputs when checking its own checkpoint identity.
+
+Checkpoint versions now include the exact embedding Dataset/version/source ID. Restore preserves this reference but does not download the raw vectors. Old checkpoints without the reference still compare existing sample/index shard names and SHA-256 values. Neither periodic checkpoints nor the inference artifact includes the raw embedding shards. Inference needs only the artifact Dataset.
 
 Every **120 minutes**, during useful data processing, the workflow pauses at a safe batch boundary, saves local state and uploads it. It also saves after SQLite import, sampling, PQ training and index construction, and on the default 600-minute processing budget. Download/extraction completion does not upload checkpoints; neither do empty payloads. Verify/status/timestamp changes alone do not create a Dataset version. The final verified artifact is uploaded separately. It no longer serializes the full FAISS index after every shard. Progress commits in SQLite remain frequent and inexpensive. Training, pickle loading, hashing and a single file extraction are not interruptible mid-operation, so a checkpoint can be delayed until those operations finish. Interrupted PQ training restarts from the saved sample.
 
-Four public Datasets are used:
+Five public Datasets are used:
 
 | Dataset suffix | Files |
 |---|---|
 | `-api-check` | Tiny JSON probe and manifest for checking Dataset read/write access |
+| `-embeddings` | Immutable original embedding shards and source manifest, published once |
 | `-corpus` | Consistent SQLite backup with import progress |
 | `-checkpoint` | Pipeline progress, sample/RNG, trained PQ, latest index generation and exact corpus Dataset/version reference |
 | `-artifact` | `corpus.sqlite`, `index.faiss`, `index_meta.faiss`, `manifest.json` plus the upload snapshot manifest |

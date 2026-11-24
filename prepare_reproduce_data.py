@@ -34,6 +34,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--cache-dir", type=Path, default=Path("./cache/huggingface"))
     parser.add_argument("--limit", type=int, help="Optional leading subset for a pilot run")
+    parser.add_argument(
+        "--questions-only",
+        action="store_true",
+        help="Export id/question/answers only; retrieval will supply ctxs later",
+    )
     args = parser.parse_args()
     if args.limit is not None and args.limit < 1:
         parser.error("--limit must be at least 1")
@@ -81,6 +86,21 @@ def normalize_example(row: Mapping[str, Any]) -> Dict[str, Any]:
     }
 
 
+def normalize_question(row: Mapping[str, Any]) -> Dict[str, Any]:
+    """Export evaluation inputs without relying on dataset-provided contexts."""
+    question = row.get("question")
+    answer = row.get("answer")
+    if not isinstance(question, str) or not question.strip():
+        raise ValueError(f"HotpotQA row {row.get('id')!r} has no question")
+    if not isinstance(answer, str) or not answer.strip():
+        raise ValueError(f"HotpotQA row {row.get('id')!r} has no answer")
+    return {
+        "id": str(row.get("id", "")),
+        "question": question.strip(),
+        "answers": [answer.strip()],
+    }
+
+
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as input_file:
@@ -108,6 +128,12 @@ def main() -> None:
     try:
         with temporary_path.open("w", encoding="utf-8", newline="\n") as output_file:
             for row in raw_dataset:
+                if args.questions_only:
+                    output_file.write(
+                        json.dumps(normalize_question(row), ensure_ascii=False) + "\n"
+                    )
+                    count += 1
+                    continue
                 context = row.get("context")
                 if not isinstance(context, Mapping):
                     raise ValueError(f"HotpotQA row {row.get('id')!r} has no context object")
@@ -137,7 +163,7 @@ def main() -> None:
                 count += 1
         if count == 0:
             raise ValueError(
-                "No HotpotQA validation examples with exactly 10 contexts were found"
+                "No HotpotQA validation examples were exported"
             )
         temporary_path.replace(args.output)
     except Exception:
@@ -150,14 +176,17 @@ def main() -> None:
         "split": SPLIT,
         "source_split_examples": source_split_examples,
         "input_examples": len(raw_dataset),
+        "export_mode": "questions_only" if args.questions_only else "with_contexts",
         "exported_examples": count,
         "skipped_example_count": len(skipped_examples),
         "skipped_examples": skipped_examples,
-        "contexts_per_example": 10,
+        "contexts_per_example": None if args.questions_only else 10,
         "input_sha256": sha256_file(args.output),
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "note": (
-            "Uses the HotpotQA distractor-provided contexts, not a separately "
+            "Contexts are omitted; attach retrieved passages in the retrieval stage."
+            if args.questions_only
+            else "Uses the HotpotQA distractor-provided contexts, not a separately "
             "retrieved Top-k corpus."
         ),
     }
